@@ -1,0 +1,37 @@
+name: ci
+
+# Tests unitaires + pipeline complet sur un lakehouse local (sans AWS).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LAKE_ROOT: ${{ github.workspace }}/lake
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+
+      - run: pip install -r pipeline/requirements.txt pytest
+
+      - name: Tests unitaires
+        run: python -m pytest -q tests
+
+      - name: Pipeline de bout en bout (API réelle -> lakehouse local)
+        run: python -m pipeline.run ingest
+
+      - name: dbt build local
+        working-directory: dbt
+        run: dbt build --profiles-dir . --target local

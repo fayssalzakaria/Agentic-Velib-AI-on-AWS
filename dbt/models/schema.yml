@@ -1,0 +1,53 @@
+version: 2
+
+models:
+  - name: stg_station_status
+    description: "Silver : une ligne par station et par snapshot horaire."
+    columns:
+      - name: snapshot_id
+        data_tests: [not_null]
+      - name: station_id
+        data_tests: [not_null]
+      - name: numbikesavailable
+        data_tests: [not_null]
+      - name: weekday
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday]
+
+  - name: gold_station_hourly_profile
+    description: "Gold : profil moyen d'une station par jour de semaine et heure."
+    columns:
+      - name: station_id
+        data_tests: [not_null]
+      - name: n_obs
+        data_tests: [not_null]
+
+  - name: gold_station_daily
+    description: "Gold : synthèse journalière par station."
+    columns:
+      - name: date
+        data_tests: [not_null]
+
+  - name: gold_network_snapshots
+    description: "Gold : indicateurs globaux du réseau à chaque snapshot."
+    columns:
+      - name: snapshot_id
+        data_tests: [not_null, unique]
+
+  - name: gold_station_period_profile
+    description: "Gold : profil par station, semaine/week-end et période (matin, après-midi, soir, nuit). Source du RAG et de Qdrant."
+    columns:
+      - name: station_id
+        data_tests: [not_null]
+      - name: day_type
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [semaine, weekend]
+      - name: period
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: [matin, apres-midi, soir, nuit]
