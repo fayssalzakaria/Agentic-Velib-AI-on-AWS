@@ -1,0 +1,74 @@
+name: daily-fallback
+
+# Job quotidien de SECOURS : compaction Delta (OPTIMIZE + VACUUM) puis modèles gold dbt.
+# Le principal est le DAG Airflow velib_daily_gold (02:15, heure de Paris), qui écrit
+# lake/_control/daily/<date>.json. Ici (06:30 à Paris) on ne relance rien si le marqueur existe.
+# Le gold n'est pas recalculé chaque heure pour limiter la sortie de données S3.
+on:
+  schedule:
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "Importer d'abord les anciens CSV (velib/history, velib/data)"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: velib-lake-writer
+  cancel-in-progress: false
+
+jobs:
+  maintain-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LAKE_ROOT: s3://${{ vars.S3_BUCKET }}/lake
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      PIPELINE_ORCHESTRATOR: github-actions
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+
+      - run: pip install -r pipeline/requirements.txt
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Lancement manuel : on force. Lancement planifié : seulement si Airflow n'est pas passé.
+      - name: Airflow a-t-il déjà fait le job du jour ?
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && python -m pipeline.control is-done daily; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Backfill des snapshots v1
+        if: ${{ inputs.backfill }}
+        run: python -m pipeline.run backfill
+
+      - name: OPTIMIZE + VACUUM silver
+        if: steps.check.outputs.skip != 'true'
+        run: python -m pipeline.run maintain
+
+      - name: dbt build (gold + tests qualité)
+        if: steps.check.outputs.skip != 'true'
+        working-directory: dbt
+        run: dbt build --profiles-dir . --target prod
+
+      - name: Marqueur de fin
+        if: steps.check.outputs.skip != 'true'
+        run: python -m pipeline.control mark-done daily

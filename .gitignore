@@ -23,3 +23,11 @@ infrastructure/*_override.tf.json
 
 .env
 .env.*
+# Lakehouse local / dbt
+.venv/
+lake/
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/
+.pytest_cache/
+dbt/.user.yml

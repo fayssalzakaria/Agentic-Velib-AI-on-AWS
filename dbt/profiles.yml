@@ -1,0 +1,21 @@
+# LAKE_ROOT : s3://<bucket>/lake en prod, chemin absolu local en dev.
+# DBT_DUCKDB_PATH : base DuckDB partagée entre les tâches Cosmos (Airflow).
+velib:
+  target: local
+  outputs:
+    local:
+      type: duckdb
+      path: "{{ env_var('DBT_DUCKDB_PATH', 'target/velib.duckdb') }}"
+      extensions: [delta]
+      external_root: "{{ env_var('LAKE_ROOT') }}/gold"
+
+    prod:
+      type: duckdb
+      path: "{{ env_var('DBT_DUCKDB_PATH', 'target/velib.duckdb') }}"
+      extensions: [httpfs, aws, delta]
+      secrets:
+        # Récupère les identifiants temporaires posés par l'OIDC GitHub Actions
+        - type: s3
+          provider: credential_chain
+          region: "{{ env_var('AWS_REGION', 'eu-north-1') }}"
+      external_root: "{{ env_var('LAKE_ROOT') }}/gold"

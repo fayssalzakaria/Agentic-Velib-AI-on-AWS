@@ -1,11 +1,7 @@
-import io
-import os
-
 import pandas as pd
 import requests
 import streamlit as st
 
-from config import S3_BUCKET
 
 
 # CHARGEMENT DES DONNEES
@@ -53,28 +49,13 @@ def load_from_api():
 
 
 @st.cache_data(ttl=300)
-def load_from_s3():
-    """Charge depuis AWS S3"""
-    try:
-        import boto3
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.environ.get("AWS_REGION", "eu-north-1"),
-        )
-        paginator = s3.get_paginator("list_objects_v2")
-        latest_key = None
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="velib/data/"):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if key.endswith(".csv"):
-                    if latest_key is None or key > latest_key:
-                        latest_key = key
-        if not latest_key:
-            return None, "Aucun fichier CSV dans S3."
-        obj = s3.get_object(Bucket=S3_BUCKET, Key=latest_key)
-        df = pd.read_csv(io.BytesIO(obj["Body"].read()), sep=";")
-        return df, latest_key
-    except Exception as e:
-        return None, str(e)
+def load_from_lake():
+    """Dernier snapshot collecté (silver du lakehouse). Renvoie (df, description) ou (None, erreur)."""
+    from src.data import lake
+
+    if not lake.is_configured():
+        return None, "LAKE_ROOT non configuré."
+    df, info = lake.latest_snapshot()
+    if df.empty:
+        return None, "Aucun snapshot dans le lakehouse."
+    return df, info

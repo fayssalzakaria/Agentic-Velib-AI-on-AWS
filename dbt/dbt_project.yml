@@ -1,0 +1,22 @@
+name: velib
+version: "2.0.0"
+config-version: 2
+profile: velib
+
+model-paths: ["models"]
+test-paths: ["tests"]
+target-path: target
+clean-targets: ["target", "dbt_packages", "logs"]
+
+vars:
+  # Fenêtre glissante utilisée pour les profils horaires des stations
+  profile_days: 90
+
+models:
+  velib:
+    staging:
+      +materialized: view
+    gold:
+      # Écrit en Parquet dans {LAKE_ROOT}/gold/<modele>.parquet
+      +materialized: external
+      +format: parquet

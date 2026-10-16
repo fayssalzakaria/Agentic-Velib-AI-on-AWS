@@ -1,7 +1,6 @@
 """
 rag.py — RAG avancé avec Hybrid Search + Reranking + MMR + HyDE + Citations
 """
-import io
 import os
 import json
 import math
@@ -16,113 +15,22 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 PARIS_TZ = pytz.timezone("Europe/Paris")
 
 
-def _load_history_df() -> pd.DataFrame:
-    engine_url = os.environ.get("POSTGRES_URL", "")
-    if engine_url:
-        try:
-            from sqlalchemy import create_engine
-            engine = create_engine(engine_url, pool_pre_ping=True)
-            with engine.connect() as conn:
-                return pd.read_sql(
-                    "SELECT * FROM velib_data ORDER BY run_at DESC LIMIT 5000",
-                    conn,
-                )
-        except Exception:
-            pass
-
-    try:
-        import boto3
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.environ.get("AWS_REGION", "eu-north-1"),
-        )
-        bucket = os.environ.get("S3_BUCKET", "velib-pipeline-fz-prod-data")
-        paginator = s3.get_paginator("list_objects_v2")
-        dfs = []
-        for page in paginator.paginate(Bucket=bucket, Prefix="velib/history/"):
-            for obj in page.get("Contents", []):
-                response = s3.get_object(Bucket=bucket, Key=obj["Key"])
-                df = pd.read_csv(io.BytesIO(response["Body"].read()), sep=";")
-                dfs.append(df)
-        if dfs:
-            return pd.concat(dfs, ignore_index=True)
-    except Exception:
-        pass
-
-    return pd.DataFrame()
-
-
-def _build_documents(df: pd.DataFrame) -> list[dict]:
-    """
-    Retourne une liste de dicts avec text + metadata pour chaque ligne.
-    """
-    if df.empty:
-        return []
-
-    df["run_at"] = pd.to_datetime(df["run_at"], utc=True, errors="coerce")
-    documents = []
-
-    for _, row in df.iterrows():
-        try:
-            run_at = row["run_at"]
-            if hasattr(run_at, "tz_convert"):
-                run_at_paris = run_at.tz_convert(PARIS_TZ)
-            else:
-                run_at_paris = run_at
-
-            heure = run_at_paris.hour
-            jour = run_at_paris.strftime("%A")
-            periode = (
-                "matin" if 6 <= heure < 12
-                else "apres-midi" if 12 <= heure < 18
-                else "soir" if 18 <= heure < 22
-                else "nuit"
-            )
-
-            text = (
-                f"Station: {row['name']}\n"
-                f"Date: {run_at_paris.strftime('%Y-%m-%d %H:%M')}\n"
-                f"Heure: {heure}h ({periode})\n"
-                f"Jour: {jour}\n"
-                f"Velos disponibles: {int(row['numbikesavailable'])}\n"
-                f"Velos electriques: {int(row['ebike'])}\n"
-                f"Velos mecaniques: {int(row['mechanical'])}\n"
-                f"Bornes disponibles: {int(row['numdocksavailable'])}\n"
-                f"Taux de remplissage: {float(row['bike_ratio']):.0%}\n"
-                f"Station vide: {'oui' if row['is_empty'] else 'non'}\n"
-                f"Station pleine: {'oui' if row['is_full'] else 'non'}\n"
-            )
-
-            documents.append({
-                "text": text,
-                "metadata": {
-                    "station": str(row.get("name", "")),
-                    "snapshot_id": str(row.get("snapshot_id", "")),
-                    "run_at": run_at_paris.strftime("%Y-%m-%d %H:%M"),
-                    "hour": heure,
-                    "weekday": jour,
-                    "periode": periode,
-                    "numbikesavailable": int(row.get("numbikesavailable", 0)),
-                    "bike_ratio": float(row.get("bike_ratio", 0)),
-                    "is_empty": bool(row.get("is_empty", False)),
-                    "is_full": bool(row.get("is_full", False)),
-                }
-            })
-        except Exception:
-            continue
-
-    return documents
+def _load_profiles() -> pd.DataFrame:
+    """Profils gold du lakehouse (dbt) : une ligne par station / type de jour / période."""
+    from src.data.lake import station_period_profiles
+    return station_period_profiles()
 
 
 def _hyde_expand_query(question: str) -> str:
     try:
         prompt = f"""Tu dois generer un exemple de document Velib qui pourrait repondre a cette question.
 Le document doit ressembler exactement a ce format :
-"La station NOM_STATION le JOUR a HEURESh (periode) avait X velos disponibles dont Y electriques et Z mecaniques. Elle etait ETAT avec un taux de remplissage de XX%. Il y avait N bornes libres."
+"Station NOM_STATION — profil historique (N observations horaires).
+En semaine : matin (6h-12h) : vide XX% du temps, pleine XX%, X vélos en moyenne dont Y électriques, Z bornes libres ; soir (18h-22h) : ...
+Le week-end : ...
+Moment le plus critique : en semaine, matin (6h-12h), vide XX% du temps."
 
-Genere 2-3 exemples de ce format pour repondre a la question.
+Genere 1 ou 2 exemples de ce format pour repondre a la question.
 Ne invente pas de faits historiques, reste dans le format des donnees.
 
 Question : {question}
@@ -433,24 +341,22 @@ def hybrid_search(
     return final_docs, trace
 
 
-def build_rag_index(df: pd.DataFrame = None):
-    if df is None or df.empty:
-        df = _load_history_df()
-    if df.empty:
-        return None, 0
+def build_rag_index(profiles: pd.DataFrame = None):
+    """Un document par station, construit depuis le gold ; embeddings précalculés une fois."""
+    from src.ai.profile_docs import station_documents
 
-    documents = _build_documents(df)
+    if profiles is None or profiles.empty:
+        profiles = _load_profiles()
+    documents = station_documents(profiles)
     if not documents:
         return None, 0
 
-    # Precalcule les embeddings une seule fois
     try:
         from sentence_transformers import SentenceTransformer
         model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        texts = [d["text"] for d in documents]
-        embeddings = model.encode(texts, show_progress_bar=False)
-        for i, doc in enumerate(documents):
-            doc["embedding"] = embeddings[i]
+        embeddings = model.encode([d["text"] for d in documents], show_progress_bar=False)
+        for doc, embedding in zip(documents, embeddings):
+            doc["embedding"] = embedding
     except Exception:
         pass
 
@@ -462,7 +368,7 @@ def ask_rag(question: str, documents) -> tuple[str, dict]:
     Retourne (réponse, trace).
     """
     if not documents:
-        return "Index RAG non disponible. Capturez des snapshots d'abord.", {}
+        return "Index RAG non disponible : aucun profil de station dans le lakehouse.", {}
 
     # Pipeline hybrid search
     final_docs, search_trace = hybrid_search(question, documents)
@@ -535,15 +441,12 @@ Question : {question}
 
 
 def ask_rag_with_qdrant_context(question: str, documents, qdrant_docs: list) -> tuple[str, dict]:
-    # Mots-clés indiquant une question temps réel
+    # Mots-clés indiquant une question sur l'instant présent
+    # (« vide » ou « pleine » seuls ne suffisent pas : « souvent vide » est historique)
     realtime_keywords = [
-        "anomalie",
         "maintenant",
         "actuellement",
         "en ce moment",
-        "disponible",
-        "vide",
-        "pleine",
     ]
     is_realtime = any(kw in question.lower() for kw in realtime_keywords)
 
@@ -603,4 +506,8 @@ Question : {question}"""
         except Exception as e:
             return f"Erreur LLM : {e}", {}
 
-    return "Aucune donnee disponible. Capturez des snapshots.", {}
+    return (
+        "Historique indisponible : le lakehouse n'a pas encore de profils de stations "
+        "(le job quotidien dbt n'est peut-être pas encore passé).",
+        {"techniques_used": [], "relevance_score": None, "relevance_explanation": ""},
+    )

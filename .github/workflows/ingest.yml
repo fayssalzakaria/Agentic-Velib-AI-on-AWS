@@ -1,0 +1,45 @@
+name: ingest-fallback
+
+# Collecteur de SECOURS. Le collecteur principal est Airflow (PC local, à :05).
+# GitHub Actions passe à :40 puis :55 : si le snapshot de l'heure existe déjà,
+# le pipeline s'arrête sans rien écrire. Sinon (PC éteint), il collecte à sa place.
+on:
+  schedule:
+    - cron: "40,55 * * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC : identifiants AWS temporaires, aucune clé stockée
+  contents: read
+
+# Un seul écrivain à la fois sur la table Delta
+concurrency:
+  group: velib-lake-writer
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      LAKE_ROOT: s3://${{ vars.S3_BUCKET }}/lake
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      PIPELINE_ORCHESTRATOR: github-actions
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pipeline/requirements.txt
+
+      - run: pip install -r pipeline/requirements.txt
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Ingestion bronze + silver (si Airflow ne l'a pas déjà fait)
+        run: python -m pipeline.run ingest

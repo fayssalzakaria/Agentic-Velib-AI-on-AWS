@@ -1,15 +1,11 @@
 streamlit
 pandas
 plotly
-boto3
 requests
 pytz
-sqlalchemy
-psycopg2-binary
 numpy
-llama-index
-llama-index-llms-groq
-llama-index-embeddings-huggingface
+duckdb==1.5.6
+rank-bm25
 sentence-transformers
 qdrant-client
 reportlab

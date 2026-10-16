@@ -1,0 +1,70 @@
+"""
+run.py — Point d'entrée du pipeline (exécuté par GitHub Actions).
+
+    python -m pipeline.run ingest     # API -> bronze -> silver
+    python -m pipeline.run maintain   # OPTIMIZE + VACUUM de la table silver
+    python -m pipeline.run backfill   # importe les anciens CSV S3 dans silver
+"""
+import argparse
+import json
+import logging
+
+from pipeline.extract import fetch_raw
+from pipeline.lake import ensure_local_layout, maintain_silver, merge_silver, snapshot_exists, write_bronze
+from pipeline.settings import lake_root, orchestrator
+from pipeline.transform import partition_date, snapshot_id_for, snapshot_time, to_silver
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s — %(message)s")
+logger = logging.getLogger("pipeline")
+
+
+def ingest() -> dict:
+    """
+    Collecte le snapshot de l'heure courante, sauf s'il existe déjà.
+
+    Airflow (PC local) est le collecteur principal ; GitHub Actions passe plus tard
+    dans l'heure et ne fait rien si Airflow a déjà écrit le snapshot.
+    """
+    ts = snapshot_time()
+    snapshot_id = snapshot_id_for(ts)
+    logger.info(f"=== Ingestion {snapshot_id} par {orchestrator()} vers {lake_root()} ===")
+
+    already_by = snapshot_exists(snapshot_id, partition_date(ts))
+    if already_by:
+        logger.info(f"Snapshot {snapshot_id} déjà collecté par {already_by} : rien à faire.")
+        return {"snapshot_id": snapshot_id, "skipped": True, "already_ingested_by": already_by}
+
+    ensure_local_layout()
+    records = fetch_raw()
+    bronze_file = write_bronze(records, ts, snapshot_id)
+    silver = to_silver(records, ts)
+    inserted = merge_silver(silver)
+
+    return {
+        "snapshot_id": snapshot_id,
+        "skipped": False,
+        "ingested_by": orchestrator(),
+        "stations": silver.num_rows,
+        "silver_rows_inserted": inserted,
+        "bronze_file": bronze_file,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Pipeline lakehouse Vélib'")
+    parser.add_argument("command", choices=["ingest", "maintain", "backfill"])
+    args = parser.parse_args()
+
+    if args.command == "ingest":
+        result = ingest()
+    elif args.command == "maintain":
+        result = maintain_silver()
+    else:
+        from pipeline.backfill import backfill
+        result = backfill()
+
+    print(json.dumps(result, ensure_ascii=False, default=str))
+
+
+if __name__ == "__main__":
+    main()

@@ -48,6 +48,32 @@ KEYWORDS_HISTORICAL = [
     "compare",
 ]
 
+# Marqueurs d'habitude : priment sur les mots d'anomalie (« souvent vide » = historique)
+KEYWORDS_HABIT = [
+    "souvent",
+    "d'habitude",
+    "habituellement",
+    "généralement",
+    "generalement",
+    "en général",
+    "en general",
+    "régulièrement",
+    "regulierement",
+    "toujours",
+    "jamais",
+    "historique",
+    "tendance",
+    "tendances",
+]
+
+# Marqueurs d'instant présent : la question porte sur maintenant, pas sur l'historique
+KEYWORDS_NOW = [
+    "maintenant",
+    "actuellement",
+    "en ce moment",
+    "aujourd'hui",
+]
+
 KEYWORDS_REPORT = [
     "rapport",
     "bilan",
@@ -75,6 +101,19 @@ def classify_question_rule_based(question: str) -> dict:
             "reason": "La question demande un rapport ou une synthèse.",
         }
 
+    is_now = any(kw in q for kw in KEYWORDS_NOW)
+
+    if not is_now and any(kw in q for kw in KEYWORDS_HABIT):
+        return {
+            "intent": "historical",
+            "confidence": 0.85,
+            "reason": (
+                "La question porte sur une habitude ou une tendance. "
+                f"Mots-clés NLP : {', '.join(keywords[:5])}. "
+                f"Temps détecté : {', '.join(time_expressions) if time_expressions else 'aucun'}."
+            ),
+        }
+
     if any(kw in q for kw in KEYWORDS_ANOMALY):
         return {
             "intent": "anomaly",
@@ -82,7 +121,7 @@ def classify_question_rule_based(question: str) -> dict:
             "reason": "La question mentionne des anomalies ou stations critiques.",
         }
 
-    if any(kw in q for kw in KEYWORDS_HISTORICAL):
+    if not is_now and any(kw in q for kw in KEYWORDS_HISTORICAL):
         return {
             "intent": "historical",
             "confidence": 0.8,
