@@ -129,33 +129,64 @@ def available_stations(hours: int = 24) -> list[str]:
     return df["name"].tolist() if not df.empty else []
 
 
-def latest_snapshot() -> tuple[pd.DataFrame, str]:
-    """Dernier snapshot du silver, au format attendu par le dashboard."""
-    df = query(f"""
-        WITH s AS (SELECT * FROM {_silver()})
-        SELECT station_id, name, numbikesavailable, mechanical, ebike, numdocksavailable,
-               is_empty, is_full, coalesce(bike_ratio, 0) AS bike_ratio, lat, lon,
-               snapshot_id, ingested_at, ingested_by
-        FROM s
-        WHERE snapshot_id = (SELECT max(snapshot_id) FROM s)
-    """)
-    if df.empty:
-        return df, ""
-    ts = pd.Timestamp(df["ingested_at"].iloc[0]).tz_convert(PARIS_TZ)
-    return df, f"snapshot du {ts:%Y-%m-%d %H:%M} (collecté par {df['ingested_by'].iloc[0]})"
-
-
 def station_period_profiles() -> pd.DataFrame:
     """Profils gold par station / type de jour / période (construits par dbt chaque nuit)."""
     return query(f"SELECT * FROM {_gold('gold_station_period_profile')}")
 
 
-def network_snapshots(days: int = 7) -> pd.DataFrame:
+def _since(days: int | None) -> tuple[str, list]:
+    """Filtre de période sur le silver (élague les partitions date=). days=None : tout l'historique."""
+    if days is None:
+        return "TRUE", []
     since = datetime.now(timezone.utc) - timedelta(days=days)
+    return "date >= ? AND ingested_at >= ?", [since.astimezone(PARIS_TZ).strftime("%Y-%m-%d"), since]
+
+
+def network_history(days: int | None = 7) -> pd.DataFrame:
+    """Indicateurs du réseau à chaque snapshot du silver : une ligne = un snapshot."""
+    where, params = _since(days)
     df = query(
-        f"SELECT * FROM {_gold('gold_network_snapshots')} WHERE ingested_at >= ? ORDER BY ingested_at",
-        [since],
+        f"""
+        SELECT snapshot_id,
+               any_value(ingested_at)            AS ingested_at,
+               any_value(ingested_by)            AS ingested_by,
+               count(*)                          AS n_stations,
+               sum(numbikesavailable)            AS total_bikes,
+               sum(ebike)                        AS total_ebike,
+               sum(numdocksavailable)            AS total_docks,
+               sum(is_empty::int)                AS empty_stations,
+               sum(is_full::int)                 AS full_stations,
+               avg(bike_ratio)                   AS avg_bike_ratio
+        FROM {_silver()}
+        WHERE {where}
+        GROUP BY snapshot_id
+        ORDER BY ingested_at
+        """,
+        params,
     )
     if not df.empty:
         df["ingested_at"] = pd.to_datetime(df["ingested_at"], utc=True).dt.tz_convert(PARIS_TZ)
     return df
+
+
+def station_stats(days: int | None = 7) -> pd.DataFrame:
+    """Comportement de chaque station sur la période : une ligne = une station."""
+    where, params = _since(days)
+    return query(
+        f"""
+        SELECT station_id,
+               arg_max(name, ingested_at)        AS name,
+               max(lat)                          AS lat,
+               max(lon)                          AS lon,
+               count(*)                          AS n_snapshots,
+               avg(numbikesavailable)            AS avg_bikes,
+               avg(ebike)                        AS avg_ebike,
+               avg(numdocksavailable)            AS avg_docks,
+               avg(is_empty::int)                AS pct_empty,
+               avg(is_full::int)                 AS pct_full
+        FROM {_silver()}
+        WHERE {where}
+        GROUP BY station_id
+        """,
+        params,
+    )

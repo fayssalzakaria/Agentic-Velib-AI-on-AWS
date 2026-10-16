@@ -7,66 +7,89 @@ import pydeck as pdk
 import pytz
 import streamlit as st
 
-from config import PARIS_TIMEZONE, SOURCE_API, SOURCE_LAKE
+from config import MODE_HISTORY, MODE_REALTIME, PARIS_TIMEZONE
 from src.ai.chatbot import ask_groq, build_context
 from src.data import lake
 from src.data.filters import search_stations
-from src.data.history import get_lake_status, get_station_history
+from src.data.data_loader import fetch_api_snapshot
+from src.data.history import get_lake_status
 from src.ai.vector_store import extract_station_from_query, build_qdrant_index, ask_with_qdrant
 from src.ai.nlp_utils import normalize_text, extract_keywords, detect_time_expression
 from src.ai.router import classify_question
 def render_sidebar():
+    """Choix du mode ; les filtres ne concernent que le snapshot temps réel."""
     st.sidebar.title("Configuration")
 
-    source = st.sidebar.radio(
-        "Source des donnees",
-        [SOURCE_API, SOURCE_LAKE],
+    mode = st.sidebar.radio(
+        "Mode",
+        [MODE_REALTIME, MODE_HISTORY],
         index=0,
+        captions=[
+            "L'état du réseau à l'instant où vous chargez la page",
+            "Statistiques sur tous les snapshots collectés",
+        ],
     )
-
     st.sidebar.divider()
-    st.sidebar.subheader("Filtres")
 
+    if mode == MODE_HISTORY:
+        from src.ui.history import render_period_selector
+        return mode, None, render_period_selector()
+
+    st.sidebar.subheader("Filtres")
     filtre_type = st.sidebar.selectbox(
         "Type de velo",
         ["Tous", "Mecaniques uniquement", "Electriques uniquement"],
     )
-
     filtre_etat = st.sidebar.selectbox(
         "Etat des stations",
         ["Tous", "Disponibles", "Vides", "Pleines"],
         index=0,
     )
-
     filtre_min_velos = st.sidebar.slider(
         "Minimum de velos disponibles",
         min_value=0,
         max_value=50,
         value=0,
     )
-
-    st.sidebar.divider()
-    sidebar_count = st.sidebar.empty()
-
-    return source, filtre_type, filtre_etat, filtre_min_velos, sidebar_count
+    return mode, (filtre_type, filtre_etat, filtre_min_velos), None
 
 
-def render_source_info(source: str, df, info: str | None = None):
-    st.sidebar.success(f"{len(df)} stations chargees")
+def get_session_snapshot(refresh: bool = False) -> pd.DataFrame | None:
+    """Snapshot propre à la session : pris à l'arrivée sur la page, puis à chaque rafraîchissement."""
+    if refresh or "snapshot_df" not in st.session_state:
+        try:
+            with st.spinner("Snapshot de l'API Vélib' en cours..."):
+                st.session_state.snapshot_df = fetch_api_snapshot()
+            st.session_state.snapshot_at = datetime.now(pytz.timezone(PARIS_TIMEZONE))
+        except Exception as e:
+            st.error(f"API Vélib' indisponible : {e}")
+            return None
+    return st.session_state.snapshot_df
 
-    if source == SOURCE_API:
-        st.caption("Source : opendata.paris.fr — temps reel")
-    else:
-        st.caption(f"Source : lakehouse S3 — {info}")
+
+def render_snapshot_header() -> pd.DataFrame | None:
+    """Heure du snapshot + bouton pour en prendre un nouveau."""
+    col_info, col_button = st.columns([4, 1])
+    with col_button:
+        refresh = st.button("🔄 Rafraîchir le snapshot", use_container_width=True)
+    df = get_session_snapshot(refresh=refresh)
+    if df is not None:
+        col_info.caption(
+            f"Snapshot pris le {st.session_state.snapshot_at:%d/%m/%Y à %H:%M:%S} — "
+            f"{len(df)} stations (API Open Data Vélib')"
+        )
+    return df
 
 
 def render_metrics(df_filtered):
-    col1, col2, col3, col4, col5 = st.columns(5)
+    """Statistiques du snapshot temps réel uniquement."""
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Stations", len(df_filtered))
     col2.metric("Velos dispo", f"{int(df_filtered['numbikesavailable'].sum()):,}")
-    col3.metric("Bornes dispo", f"{int(df_filtered['numdocksavailable'].sum()):,}")
-    col4.metric("Stations vides", int(df_filtered["is_empty"].sum()))
-    col5.metric("Remplissage", f"{df_filtered['bike_ratio'].mean():.1%}")
+    col3.metric("Dont electriques", f"{int(df_filtered['ebike'].sum()):,}")
+    col4.metric("Bornes dispo", f"{int(df_filtered['numdocksavailable'].sum()):,}")
+    col5.metric("Vides / pleines", f"{int(df_filtered['is_empty'].sum())} / {int(df_filtered['is_full'].sum())}")
+    col6.metric("Remplissage", f"{df_filtered['bike_ratio'].mean():.1%}")
     st.divider()
 
 def render_map(df_filtered):
@@ -254,30 +277,14 @@ def render_downloads(df_filtered):
             use_container_width=True,
         )
 
-def render_last_update():
-    paris_tz = pytz.timezone(PARIS_TIMEZONE)
-    now = datetime.now(paris_tz).strftime("%Y-%m-%d %H:%M")
-    st.caption(f"Derniere mise a jour : {now}")
-
 def render_station_detail(df_filtered):
-    st.subheader("Recherche et historique de station")
+    st.subheader("Recherche de station")
 
-    col1, col2 = st.columns([3, 1])
-
-    with col1:
-        search = st.text_input(
-            "Nom de la station",
-            placeholder="Ex: Bastille, Nation, Mairie de Clichy...",
-            key="station_search",
-        )
-
-    with col2:
-        hours = st.selectbox(
-            "Historique",
-            [6, 12, 24, 48, 72, 168, 720],
-            index=2,
-            format_func=lambda x: f"{x}h" if x < 168 else ("7 jours" if x == 168 else "30 jours"),
-        )   
+    search = st.text_input(
+        "Nom de la station",
+        placeholder="Ex: Bastille, Nation, Mairie de Clichy...",
+        key="station_search",
+    )
 
     if not search:
         return
@@ -321,99 +328,7 @@ def render_station_detail(df_filtered):
     else:
         st.success("Station disponible")
 
-    # Historique automatique
-    with st.spinner(f"Chargement historique {station_name}..."):
-        df_history = get_station_history(station_name, hours)
-
-    if df_history.empty:
-        if not lake.is_configured():
-            st.info("Historique indisponible : lakehouse non configuré (mode temps réel seul).")
-        else:
-            st.info("Pas encore d'historique pour cette station sur cette période.")
-        st.divider()
-        return
-
-    collectors = ", ".join(sorted(df_history["ingested_by"].dropna().unique()))
-    st.caption(
-        f"Evolution sur les {hours} dernieres heures — {len(df_history)} snapshots "
-        f"(collectés par : {collectors})"
-    )
-
-    fig = px.line(
-        df_history,
-        x="run_at",
-        y=["numbikesavailable", "ebike", "mechanical"],
-        labels={"run_at": "Heure", "value": "Nombre", "variable": "Type"},
-        color_discrete_map={
-            "numbikesavailable": "#1D9E75",
-            "ebike": "#185FA5",
-            "mechanical": "#EF9F27",
-        },
-    )
-    fig.update_layout(height=300, margin=dict(t=10, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.divider()
-
-def _reset_ai_state():
-    for key in ["rag_documents", "rag_docs", "qdrant_client", "qdrant_docs"]:
-        st.session_state.pop(key, None)
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def _network_snapshots(days: int = 7) -> pd.DataFrame:
-    return lake.network_snapshots(days)
-
-
-def render_lake_panel():
-    """État du lakehouse : la collecte est automatique (Airflow, GitHub Actions en secours)."""
-    st.subheader("Historique (lakehouse)")
-
-    status = get_lake_status()
-    if not status.get("available"):
-        if lake.is_configured():
-            st.warning("Lakehouse inaccessible ou vide — mode temps réel seul.")
-        else:
-            st.info("Lakehouse non configuré (LAKE_ROOT) — mode temps réel seul.")
-        st.divider()
-        return
-
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Snapshots horaires", status["snapshots"])
-    col2.metric("Depuis le", f"{status['first_snapshot']:%d/%m/%Y}")
-    col3.metric("Dernier snapshot", f"{status['last_snapshot']:%d/%m %H:%M}")
-    col4.metric("Collecté par", status["last_ingested_by"])
-
-    if st.button("Rafraichir l'historique"):
-        st.cache_data.clear()
-        _shared_rag_index.clear()
-        _reset_ai_state()
-        st.rerun()
-
-    trend = _network_snapshots(7)
-    if not trend.empty:
-        st.caption(
-            f"Réseau sur 7 jours — {len(trend)} snapshots horaires "
-            "(gold dbt, mis à jour chaque nuit)"
-        )
-        # Un graphique par indicateur : ~18 000 vélos et ~100 stations vides
-        # n'ont pas la même échelle
-        col_bikes, col_empty = st.columns(2)
-        for col, column, title, color in [
-            (col_bikes, "total_bikes", "Vélos disponibles", "#1D9E75"),
-            (col_empty, "empty_stations", "Stations vides", "#A32D2D"),
-        ]:
-            fig = px.line(
-                trend,
-                x="ingested_at",
-                y=column,
-                markers=True,
-                labels={"ingested_at": "Heure", column: title},
-                color_discrete_sequence=[color],
-            )
-            fig.update_layout(title=title, height=260, margin=dict(t=40, b=10))
-            col.plotly_chart(fig, use_container_width=True)
-
+    st.caption("Évolution de cette station dans le temps : mode 📚 Historique.")
     st.divider()
 
 

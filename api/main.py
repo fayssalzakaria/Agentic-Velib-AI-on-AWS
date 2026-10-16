@@ -19,7 +19,7 @@ from pydantic import BaseModel
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from src.ai.langchain_assistant import summarize_with_langchain
-from src.data.data_loader import load_from_api
+from src.data.data_loader import fetch_api_snapshot
 from src.ai.assistant import run_unified_assistant
 from src.ai.rag import build_rag_index
 from src.ai.router import classify_question
@@ -79,7 +79,7 @@ def route_question(payload: AskRequest) -> Dict[str, Any]:
 
 @app.post("/ask", response_model=AskResponse)
 def ask_assistant(payload: AskRequest) -> AskResponse:
-    df = load_from_api()
+    df = fetch_api_snapshot()
 
     answer, trace = run_unified_assistant(
         payload.question,
