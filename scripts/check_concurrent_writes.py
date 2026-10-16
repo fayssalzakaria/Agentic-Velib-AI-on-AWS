@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from pyarrow import fs as pa_fs  # noqa: E402
+
 RECORD = {
     "stationcode": "00000", "name": "STATION TEST", "capacity": 10,
     "numbikesavailable": 3, "numdocksavailable": 7, "mechanical": 2, "ebike": 1,
@@ -46,6 +48,14 @@ def _writer(index: int, test_root: str, start_at: float, results):
         results[index] = f"ERREUR : {e}"
 
 
+def _delete_prefix(filesystem, path: str) -> None:
+    """Supprime tous les fichiers sous un préfixe (sans HeadBucket, compatible IAM par préfixe)."""
+    selector = pa_fs.FileSelector(path, recursive=True, allow_not_found=True)
+    for info in filesystem.get_file_info(selector):
+        if info.type == pa_fs.FileType.File:
+            filesystem.delete_file(info.path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cleanup", action="store_true", help="supprime la table de test")
@@ -58,7 +68,6 @@ def main():
     if not on_s3 and not args.allow_local:
         sys.exit("LAKE_ROOT doit pointer vers S3 (s3://<bucket>/lake).")
 
-    from pyarrow import fs as pa_fs
     from pipeline.settings import AWS_REGION
 
     if on_s3:
@@ -67,15 +76,12 @@ def main():
         s3, test_path = pa_fs.LocalFileSystem(), os.path.abspath(test_root)
 
     if args.cleanup:
-        s3.delete_dir(test_path)
+        _delete_prefix(s3, test_path)
         print(f"Supprimé : {test_path}")
         return
 
     # Table de test vide au départ, créée avant la course
-    try:
-        s3.delete_dir(test_path)
-    except (FileNotFoundError, OSError):
-        pass
+    _delete_prefix(s3, test_path)
     os.environ["PIPELINE_ORCHESTRATOR"] = "setup"
     os.environ["LAKE_ROOT"] = test_root
     from pipeline.lake import merge_silver

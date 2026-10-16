@@ -40,8 +40,8 @@ def done_by(job: str, day: str | None = None) -> str | None:
 
 def mark_done(job: str, day: str | None = None) -> str:
     filesystem, path = _marker_path(job, day or today())
-    parent = path.rsplit("/", 1)[0] if is_s3(lake_root()) else os.path.dirname(path)
-    filesystem.create_dir(parent, recursive=True)
+    if not is_s3(lake_root()):  # pas de dossiers sur S3
+        filesystem.create_dir(os.path.dirname(path), recursive=True)
     payload = {"orchestrator": orchestrator(), "finished_at": datetime.now(timezone.utc).isoformat()}
     with filesystem.open_output_stream(path, compression=None) as out:
         out.write(json.dumps(payload).encode("utf-8"))

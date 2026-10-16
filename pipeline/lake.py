@@ -46,7 +46,10 @@ def write_bronze(records: list[dict], ts: datetime, snapshot_id: str) -> str:
         f"{base}/year={ts:%Y}/month={ts:%m}/day={ts:%d}/"
         f"snapshot_{snapshot_id}.json.gz"
     )
-    filesystem.create_dir(path.rsplit("/", 1)[0], recursive=True)
+    # S3 n'a pas de dossiers : create_dir y déclencherait un HeadBucket inutile (et refusé
+    # par une politique IAM limitée à des préfixes)
+    if not is_s3(bronze_uri()):
+        filesystem.create_dir(path.rsplit("/", 1)[0], recursive=True)
 
     payload = gzip.compress(json.dumps(records, ensure_ascii=False).encode("utf-8"))
     # compression=None : sinon pyarrow recompresse les fichiers .gz
