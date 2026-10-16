@@ -350,16 +350,27 @@ def render_lake_panel():
 
     trend = _network_snapshots(7)
     if not trend.empty:
-        fig = px.line(
-            trend,
-            x="ingested_at",
-            y=["total_bikes", "empty_stations"],
-            labels={"ingested_at": "Heure", "value": "Nombre", "variable": "Indicateur"},
-            color_discrete_map={"total_bikes": "#1D9E75", "empty_stations": "#A32D2D"},
+        st.caption(
+            f"Réseau sur 7 jours — {len(trend)} snapshots horaires "
+            "(gold dbt, mis à jour chaque nuit)"
         )
-        fig.update_layout(height=260, margin=dict(t=10, b=10))
-        st.caption("Réseau sur 7 jours (gold dbt, mis à jour chaque nuit)")
-        st.plotly_chart(fig, use_container_width=True)
+        # Un graphique par indicateur : ~18 000 vélos et ~100 stations vides
+        # n'ont pas la même échelle
+        col_bikes, col_empty = st.columns(2)
+        for col, column, title, color in [
+            (col_bikes, "total_bikes", "Vélos disponibles", "#1D9E75"),
+            (col_empty, "empty_stations", "Stations vides", "#A32D2D"),
+        ]:
+            fig = px.line(
+                trend,
+                x="ingested_at",
+                y=column,
+                markers=True,
+                labels={"ingested_at": "Heure", column: title},
+                color_discrete_sequence=[color],
+            )
+            fig.update_layout(title=title, height=260, margin=dict(t=40, b=10))
+            col.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
