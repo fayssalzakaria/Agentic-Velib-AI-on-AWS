@@ -3,12 +3,14 @@ from datetime import datetime
 from src.ai.assistant import run_unified_assistant
 import pandas as pd
 import plotly.express as px
+import pydeck as pdk
 import pytz
 import streamlit as st
 
 from config import PARIS_TIMEZONE, SOURCE_API, SOURCE_LAKE
 from src.ai.chatbot import ask_groq, build_context
 from src.data import lake
+from src.data.filters import search_stations
 from src.data.history import get_lake_status, get_station_history
 from src.ai.vector_store import extract_station_from_query, build_qdrant_index, ask_with_qdrant
 from src.ai.nlp_utils import normalize_text, extract_keywords, detect_time_expression
@@ -71,14 +73,44 @@ def render_map(df_filtered):
     st.subheader("Carte des stations")
 
     if "lat" in df_filtered.columns and df_filtered["lat"].notna().any():
-        map_df = df_filtered[["name", "lat", "lon", "numbikesavailable"]].dropna()
-        st.map(
-            map_df,
-            latitude="lat",
-            longitude="lon",
-            size="numbikesavailable",
-            color="#1D9E75",
+        map_df = df_filtered[
+            ["name", "lat", "lon", "numbikesavailable", "ebike", "numdocksavailable"]
+        ].dropna(subset=["lat", "lon"]).copy()
+        map_df["lat"] = map_df["lat"].astype(float)
+        map_df["lon"] = map_df["lon"].astype(float)
+        # Rouge : aucun vélo ; vert : au moins un vélo
+        map_df["color"] = [
+            [163, 45, 45, 210] if bikes == 0 else [29, 158, 117, 190]
+            for bikes in map_df["numbikesavailable"]
+        ]
+
+        layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=map_df,
+            get_position="[lon, lat]",
+            get_fill_color="color",
+            get_radius=45,
+            radius_min_pixels=3,
+            radius_max_pixels=12,
+            pickable=True,
         )
+        tooltip = {
+            "html": "<b>{name}</b><br/>Vélos : {numbikesavailable} (dont {ebike} électriques)"
+                    "<br/>Bornes libres : {numdocksavailable}",
+            "style": {"fontSize": "13px"},
+        }
+        st.pydeck_chart(
+            pdk.Deck(
+                layers=[layer],
+                initial_view_state=pdk.ViewState(latitude=48.8566, longitude=2.3522, zoom=11.5),
+                tooltip=tooltip,
+                map_provider="carto",
+                map_style="light",
+            ),
+            use_container_width=True,
+        )
+        n_empty = int((map_df["numbikesavailable"] == 0).sum())
+        st.caption(f"🟢 vélos disponibles · 🔴 aucun vélo ({n_empty} stations) — survolez une station pour le détail")
     else:
         st.info("Coordonnees non disponibles pour ce snapshot.")
 
@@ -250,16 +282,26 @@ def render_station_detail(df_filtered):
     if not search:
         return
 
-    results = df_filtered[df_filtered["name"].str.contains(search.upper(), na=False)]
+    results = search_stations(df_filtered, search)
 
     if results.empty:
         st.warning(f"Aucune station trouvee pour '{search}'")
         return
 
-    # Selectbox si plusieurs stations matchent
+    # Plusieurs stations : on montre combien et on laisse choisir (rien de présélectionné)
     station_names = sorted(results["name"].unique().tolist())
     if len(station_names) > 1:
-        station_name = st.selectbox("Choisir une station", station_names)
+        bikes = results.groupby("name")["numbikesavailable"].first()
+        station_name = st.selectbox(
+            f"{len(station_names)} stations trouvées pour « {search} »",
+            station_names,
+            index=None,
+            placeholder="Choisir une station…",
+            format_func=lambda name: f"{name} — {int(bikes[name])} vélos",
+        )
+        if station_name is None:
+            st.divider()
+            return
     else:
         station_name = station_names[0]
 

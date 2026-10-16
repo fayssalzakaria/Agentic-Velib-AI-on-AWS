@@ -1,4 +1,26 @@
+import re
+import unicodedata
+
 import pandas as pd
+
+
+def normalize_name(text: str) -> str:
+    """Majuscules, sans accents ni ponctuation : « Châtelet - Rivoli » -> « CHATELET RIVOLI »."""
+    text = unicodedata.normalize("NFKD", str(text))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return re.sub(r"[^A-Z0-9]+", " ", text.upper()).strip()
+
+
+def search_stations(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Stations dont le nom contient tous les mots de la recherche, sans tenir compte des accents ni de l'ordre."""
+    words = normalize_name(query).split()
+    if not words or df.empty:
+        return df.iloc[0:0]
+    names = df["name"].map(normalize_name)
+    mask = pd.Series(True, index=df.index)
+    for word in words:
+        mask &= names.str.contains(word, regex=False)
+    return df[mask]
 
 
 def apply_filters(

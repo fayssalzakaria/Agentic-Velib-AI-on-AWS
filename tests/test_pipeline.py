@@ -110,3 +110,18 @@ def test_fallback_ingest_skips_when_primary_already_ran(tmp_path, monkeypatch):
 def test_router_intents(question, intent):
     from src.ai.router import classify_question_rule_based
     assert classify_question_rule_based(question)["intent"] == intent
+
+
+def test_search_stations_ignores_accents_order_and_punctuation():
+    import pandas as pd
+    from src.data.filters import search_stations
+
+    df = pd.DataFrame({"name": [
+        "ATHÈNES - CLICHY", "MAIRIE DE CLICHY", "BESSIÈRES - PORTE DE CLICHY",
+        "PLACE DE LA RÉPUBLIQUE - VOLTAIRE", "BASTILLE - BISCORNET",
+    ]})
+    assert len(search_stations(df, "clichy")) == 3
+    assert search_stations(df, "porte clichy")["name"].tolist() == ["BESSIÈRES - PORTE DE CLICHY"]
+    assert search_stations(df, "republique")["name"].tolist() == ["PLACE DE LA RÉPUBLIQUE - VOLTAIRE"]
+    assert search_stations(df, "athenes")["name"].tolist() == ["ATHÈNES - CLICHY"]
+    assert search_stations(df, "  ").empty
