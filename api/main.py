@@ -9,8 +9,8 @@ Endpoints :
 
 import os
 import sys
+from functools import lru_cache
 from typing import Optional, Dict, Any
-from src.ai.langchain_assistant import summarize_with_langchain
 import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -18,8 +18,10 @@ from pydantic import BaseModel
 # Permet d'importer le projet depuis la racine
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
+from src.ai.langchain_assistant import summarize_with_langchain
 from src.data.data_loader import load_from_api
 from src.ai.assistant import run_unified_assistant
+from src.ai.rag import build_rag_index
 from src.ai.router import classify_question
 from src.ai.nlp_utils import extract_keywords, detect_time_expression, normalize_text
 
@@ -50,6 +52,13 @@ class LangChainRequest(BaseModel):
     question: str
     context: str
 
+@lru_cache(maxsize=1)
+def _rag_documents():
+    """Profils de stations du lakehouse, chargés une fois par processus (None si indisponible)."""
+    documents, _ = build_rag_index()
+    return documents
+
+
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {
@@ -76,7 +85,7 @@ def ask_assistant(payload: AskRequest) -> AskResponse:
         payload.question,
         df,
         qdrant_client=None,
-        rag_documents=None,
+        rag_documents=_rag_documents(),
         qdrant_docs=[],
         use_llm_router=payload.use_llm_router,
     )

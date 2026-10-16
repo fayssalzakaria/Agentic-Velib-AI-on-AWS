@@ -1,81 +1,20 @@
 """
-vector_store.py — Qdrant Cloud vector store pour les données Vélib'
-Persistent, gratuit, compatible Python 3.14
+vector_store.py — Qdrant Cloud : recherche sémantique sur les profils des stations.
+
+Un point par station (document construit depuis le gold dbt, voir profile_docs.py).
+La collection est reconstruite automatiquement quand le gold change.
 """
-import io
 import os
 import uuid
+
 import pandas as pd
 import pytz
-import hashlib
-import json
 from llm_client import call_llm_text, verify_relevance
+
 PARIS_TZ = pytz.timezone("Europe/Paris")
-S3_BUCKET = os.environ.get("S3_BUCKET", "velib-pipeline-fz-prod-data")
 QDRANT_URL = os.environ.get("QDRANT_URL", "")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", "")
-COLLECTION_NAME = "velib_snapshots"
-
-
-def _get_s3():
-    try:
-        import boto3
-        return boto3.client(
-            "s3",
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.environ.get("AWS_REGION", "eu-north-1"),
-        )
-    except Exception:
-        return None
-
-
-def _load_history_from_s3() -> pd.DataFrame:
-    s3 = _get_s3()
-    if s3 is None:
-        return pd.DataFrame()
-    try:
-        paginator = s3.get_paginator("list_objects_v2")
-        dfs = []
-        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix="velib/history/"):
-            for obj in page.get("Contents", []):
-                response = s3.get_object(Bucket=S3_BUCKET, Key=obj["Key"])
-                df = pd.read_csv(io.BytesIO(response["Body"].read()), sep=";")
-                dfs.append(df)
-        if not dfs:
-            return pd.DataFrame()
-        return pd.concat(dfs, ignore_index=True)
-    except Exception:
-        return pd.DataFrame()
-
-
-def _row_to_text(row) -> str:
-    try:
-        run_at = pd.to_datetime(row["run_at"], utc=True)
-        run_at_paris = run_at.tz_convert(PARIS_TZ)
-        heure = run_at_paris.hour
-        jour = run_at_paris.strftime("%A")
-        periode = (
-            "matin" if 6 <= heure < 12
-            else "apres-midi" if 12 <= heure < 18
-            else "soir" if 18 <= heure < 22
-            else "nuit"
-        )
-        etat = (
-            "vide" if row["is_empty"]
-            else "pleine" if row["is_full"]
-            else "partiellement remplie"
-        )
-        return (
-            f"La station {row['name']} le {jour} a {heure}h ({periode}) "
-            f"avait {int(row['numbikesavailable'])} velos disponibles "
-            f"dont {int(row['ebike'])} electriques et {int(row['mechanical'])} mecaniques. "
-            f"Elle etait {etat} avec un taux de remplissage de "
-            f"{float(row['bike_ratio']):.0%}. "
-            f"Il y avait {int(row['numdocksavailable'])} bornes libres."
-        )
-    except Exception:
-        return ""
+COLLECTION_NAME = "velib_station_profiles"
 
 
 def _get_qdrant_client():
@@ -103,85 +42,70 @@ def _collection_count(client) -> int:
         return 0
 
 
-def build_qdrant_index(df: pd.DataFrame = None):
+def _indexed_version(client) -> str:
+    """Version du gold actuellement indexée (stockée dans le payload des points)."""
+    try:
+        points, _ = client.scroll(collection_name=COLLECTION_NAME, limit=1, with_payload=True)
+        return points[0].payload.get("profiles_version", "") if points else ""
+    except Exception:
+        return ""
+
+
+def build_qdrant_index(profiles: pd.DataFrame = None):
     """
-    Connexion rapide a Qdrant — reindexe seulement si collection vide ou absente.
+    Connexion à Qdrant ; réindexe seulement si le gold a changé depuis la dernière indexation.
+    Renvoie (client, nombre de points).
     """
     try:
+        from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
         from sentence_transformers import SentenceTransformer
-        from qdrant_client.models import Distance, VectorParams, PointStruct, PayloadSchemaType
+        from src.ai.profile_docs import profiles_version, station_documents
+        from src.data.lake import station_period_profiles
 
         client = _get_qdrant_client()
         if client is None:
             return None, 0
 
-        # Si collection existe et a des points — retourne immediatement
+        if profiles is None or profiles.empty:
+            profiles = station_period_profiles()
+        version = profiles_version(profiles)
+
         if _collection_exists(client):
-            count = _collection_count(client)
-            if count > 0:
-                return client, count
+            if not version or _indexed_version(client) == version:
+                return client, _collection_count(client)
+            client.delete_collection(COLLECTION_NAME)
 
-        # Collection vide ou absente — charge les donnees et indexe
-        if df is None or df.empty:
-            df = _load_history_from_s3()
-
-        if df.empty:
+        documents = station_documents(profiles)
+        if not documents:
             return client, 0
 
-        # Cree la collection
-        if not _collection_exists(client):
-            client.create_collection(
-                collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-            )
-            client.create_payload_index(
-                collection_name=COLLECTION_NAME,
-                field_name="station",
-                field_schema=PayloadSchemaType.KEYWORD,
-            )
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+        )
+        client.create_payload_index(
+            collection_name=COLLECTION_NAME,
+            field_name="station",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
 
         model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        texts = []
-        payloads = []
-
-        for _, row in df.iterrows():
-            text = _row_to_text(row)
-            if text:
-                texts.append(text)
-                payloads.append({
-                    "station": str(row.get("name", "")),
-                    "hour": int(row.get("hour", 0)),
-                    "weekday": str(row.get("weekday", "")),
-                    "is_empty": bool(row.get("is_empty", False)),
-                    "snapshot_id": str(row.get("snapshot_id", "")),
-                })
-
-        if not texts:
-            return client, 0
-
-        embeddings = model.encode(texts, show_progress_bar=False)
+        embeddings = model.encode([d["text"] for d in documents], show_progress_bar=False)
 
         points = [
             PointStruct(
-                id=hashlib.md5(
-                    f"{p.get('snapshot_id','')}{p.get('station','')}".encode()
-                ).hexdigest(),
+                id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"velib/{doc['metadata']['station_id']}")),
                 vector=embedding.tolist(),
-                payload={**p, "text": text},
+                payload={**doc["metadata"], "text": doc["text"], "profiles_version": version},
             )
-            for text, embedding, p in zip(texts, embeddings, payloads)
+            for doc, embedding in zip(documents, embeddings)
         ]
-
-        batch_size = 100
-        for i in range(0, len(points), batch_size):
-            client.upsert(
-                collection_name=COLLECTION_NAME,
-                points=points[i:i+batch_size],
-            )
+        for i in range(0, len(points), 100):
+            client.upsert(collection_name=COLLECTION_NAME, points=points[i:i + 100])
 
         return client, _collection_count(client)
 
-    except Exception as e:
+    except Exception:
         return None, 0
 
 

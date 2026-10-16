@@ -6,10 +6,10 @@ import plotly.express as px
 import pytz
 import streamlit as st
 
-from config import API_ENDPOINT, PARIS_TIMEZONE, SOURCE_API, SOURCE_S3
+from config import PARIS_TIMEZONE, SOURCE_API, SOURCE_LAKE
 from src.ai.chatbot import ask_groq, build_context
-from src.data.history import get_station_history, get_available_stations
-from src.data.snapshot import capture_snapshot_aws, capture_snapshot_s3
+from src.data import lake
+from src.data.history import get_lake_status, get_station_history
 from src.ai.vector_store import extract_station_from_query, build_qdrant_index, ask_with_qdrant
 from src.ai.nlp_utils import normalize_text, extract_keywords, detect_time_expression
 from src.ai.router import classify_question
@@ -18,7 +18,7 @@ def render_sidebar():
 
     source = st.sidebar.radio(
         "Source des donnees",
-        [SOURCE_API, SOURCE_S3],
+        [SOURCE_API, SOURCE_LAKE],
         index=0,
     )
 
@@ -55,7 +55,7 @@ def render_source_info(source: str, df, info: str | None = None):
     if source == SOURCE_API:
         st.caption("Source : opendata.paris.fr — temps reel")
     else:
-        st.caption(f"Source : AWS S3 — {info}")
+        st.caption(f"Source : lakehouse S3 — {info}")
 
 
 def render_metrics(df_filtered):
@@ -197,19 +197,9 @@ def render_chatbot(df_filtered):
 def render_downloads(df_filtered):
     st.subheader("Telechargements")
 
-    col_dl1, col_dl2, col_dl3 = st.columns(3)
+    col_dl1, col_dl2 = st.columns(2)
 
     with col_dl1:
-        if API_ENDPOINT:
-            st.link_button(
-                "Rapport PDF (AWS)",
-                f"{API_ENDPOINT}/download/report",
-                use_container_width=True,
-            )
-        else:
-            st.info("API AWS non configure")
-
-    with col_dl2:
         if st.button("Generer rapport PDF", use_container_width=True):
             with st.spinner("Generation du rapport..."):
                 from src.reports.report_generator import generate_pdf_report
@@ -222,7 +212,7 @@ def render_downloads(df_filtered):
                 use_container_width=True,
             )
 
-    with col_dl3:
+    with col_dl2:
         csv_bytes = df_filtered.to_csv(index=False, sep=";").encode("utf-8")
         st.download_button(
             "Telecharger CSV",
@@ -294,11 +284,18 @@ def render_station_detail(df_filtered):
         df_history = get_station_history(station_name, hours)
 
     if df_history.empty:
-        st.info("Aucun historique disponible. Capturez des snapshots pour voir l'evolution.")
+        if not lake.is_configured():
+            st.info("Historique indisponible : lakehouse non configuré (mode temps réel seul).")
+        else:
+            st.info("Pas encore d'historique pour cette station sur cette période.")
         st.divider()
         return
 
-    st.caption(f"Evolution sur les {hours} dernieres heures — {len(df_history)} snapshots")
+    collectors = ", ".join(sorted(df_history["ingested_by"].dropna().unique()))
+    st.caption(
+        f"Evolution sur les {hours} dernieres heures — {len(df_history)} snapshots "
+        f"(collectés par : {collectors})"
+    )
 
     fig = px.line(
         df_history,
@@ -316,58 +313,52 @@ def render_station_detail(df_filtered):
 
     st.divider()
 
-def render_snapshot_button(source: str):
-    st.subheader("Capturer un snapshot")
+def _reset_ai_state():
+    for key in ["rag_documents", "rag_docs", "qdrant_client", "qdrant_docs"]:
+        st.session_state.pop(key, None)
 
-    postgres_url = os.environ.get("POSTGRES_URL", "")
-    aws_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    pipeline_lambda = os.environ.get("PIPELINE_LAMBDA", "")
-    s3_bucket = os.environ.get("S3_BUCKET", "")
 
-    s3_active = bool(aws_key and s3_bucket)
-    aws_active = bool(postgres_url and aws_key and pipeline_lambda)
+@st.cache_data(ttl=600, show_spinner=False)
+def _network_snapshots(days: int = 7) -> pd.DataFrame:
+    return lake.network_snapshots(days)
 
-    if aws_active:
-        st.info("Aurora active — snapshot dans Aurora et S3.")
-        if st.button("Lancer le pipeline AWS", type="primary"):
-            with st.spinner("Pipeline en cours..."):
-                success, message = capture_snapshot_aws()
-            if success:
-                st.success(message)
-                st.cache_data.clear()
-                st.cache_data.clear()
-                from src.data.snapshot import refresh_ai_indexes
-                refresh_ai_indexes()
-                st.rerun()
-            else:
-                st.error(message)
 
-    elif s3_active:
-        st.info("Snapshot sauvegarde dans S3.")
-        if st.button("Capturer snapshot S3", type="primary"):
-            with st.spinner("Capture en cours..."):
-                success, message = capture_snapshot_s3()
-            if success:
-                st.success(message)
-                st.cache_data.clear()
-                from src.data.snapshot import refresh_ai_indexes
-                refresh_ai_indexes()
-                st.rerun()
-            else:
-                st.error(message)
+def render_lake_panel():
+    """État du lakehouse : la collecte est automatique (Airflow, GitHub Actions en secours)."""
+    st.subheader("Historique (lakehouse)")
 
-    else:
-        st.warning("AWS non configure — snapshots non persistants.")
-        if st.button("Capturer snapshot local", type="primary"):
-            with st.spinner("Capture en cours..."):
-                success, message = capture_snapshot_s3()
-            if success:
-                st.success(message)
-                from src.data.snapshot import refresh_ai_indexes
-                refresh_ai_indexes()
-                st.rerun()
-            else:
-                st.error(message)
+    status = get_lake_status()
+    if not status.get("available"):
+        if lake.is_configured():
+            st.warning("Lakehouse inaccessible ou vide — mode temps réel seul.")
+        else:
+            st.info("Lakehouse non configuré (LAKE_ROOT) — mode temps réel seul.")
+        st.divider()
+        return
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Snapshots horaires", status["snapshots"])
+    col2.metric("Depuis le", f"{status['first_snapshot']:%d/%m/%Y}")
+    col3.metric("Dernier snapshot", f"{status['last_snapshot']:%d/%m %H:%M}")
+    col4.metric("Collecté par", status["last_ingested_by"])
+
+    if st.button("Rafraichir l'historique"):
+        st.cache_data.clear()
+        _reset_ai_state()
+        st.rerun()
+
+    trend = _network_snapshots(7)
+    if not trend.empty:
+        fig = px.line(
+            trend,
+            x="ingested_at",
+            y=["total_bikes", "empty_stations"],
+            labels={"ingested_at": "Heure", "value": "Nombre", "variable": "Indicateur"},
+            color_discrete_map={"total_bikes": "#1D9E75", "empty_stations": "#A32D2D"},
+        )
+        fig.update_layout(height=260, margin=dict(t=10, b=10))
+        st.caption("Réseau sur 7 jours (gold dbt, mis à jour chaque nuit)")
+        st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
@@ -381,42 +372,30 @@ def _get_qdrant_client_cached():
     return st.session_state.get("qdrant_client"), st.session_state.get("qdrant_docs", 0)
 
 
-def _render_rag_content(df_filtered=None):
-    st.info("Pour les questions sur l'etat actuel d'une station (anomalies, disponibilite), utilisez l'onglet Agent IA qui a acces aux donnees temps reel.")
-    has_history = False
-    try:
-        import boto3
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.environ.get("AWS_REGION", "eu-north-1"),
-        )
-        bucket = os.environ.get("S3_BUCKET", "")
-        if bucket:
-            resp = s3.list_objects_v2(Bucket=bucket, Prefix="velib/history/")
-            has_history = resp.get("KeyCount", 0) > 0
-    except Exception:
-        pass
-
-    if not has_history:
-        st.info("Capturez des snapshots pour activer le RAG.")
-        render_chatbot(df_filtered)
-        return
-
+def _ensure_rag_documents():
     if "rag_documents" not in st.session_state:
-        with st.spinner("Chargement des documents RAG..."):
+        with st.spinner("Chargement des profils de stations (gold)..."):
             from src.ai.rag import build_rag_index
             docs, n_docs = build_rag_index()
             st.session_state.rag_documents = docs
             st.session_state.rag_docs = n_docs
+    return st.session_state.rag_documents
+
+
+def _render_rag_content(df_filtered=None):
+    st.info("Pour les questions sur l'etat actuel d'une station (anomalies, disponibilite), utilisez l'onglet Agent IA qui a acces aux donnees temps reel.")
+
+    if not _ensure_rag_documents():
+        st.info("Historique indisponible : aucun profil de station dans le lakehouse. Chatbot sur les données temps réel :")
+        render_chatbot(df_filtered)
+        return
 
     if st.session_state.rag_documents:
         col1, col2 = st.columns([3, 1])
         with col1:
             rag_docs = st.session_state.get("rag_docs", 0)
             st.caption(
-                f"Index RAG : {rag_docs} documents — "
+                f"Index RAG : {rag_docs} profils de stations — "
                 f"HyDE + BM25 + Cosine + RRF + MMR + Reranking"
             )
         with col2:
@@ -614,80 +593,23 @@ def _render_semantic_content():
         )
 
 
-def render_snapshot_manager():
+def render_lake_sidebar():
     st.sidebar.divider()
-    st.sidebar.subheader("Gestion snapshots")
+    st.sidebar.subheader("Lakehouse")
 
-    s3_key = os.environ.get("AWS_ACCESS_KEY_ID", "")
-    bucket = os.environ.get("S3_BUCKET", "")
-
-    if not s3_key or not bucket:
-        st.sidebar.info("AWS non configure.")
+    if not lake.is_configured():
+        st.sidebar.info("Non configuré — mode temps réel seul.")
         return
 
-    try:
-        import boto3
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.environ.get("AWS_REGION", "eu-north-1"),
-        )
-        paginator = s3.get_paginator("list_objects_v2")
-        keys = []
-        for page in paginator.paginate(Bucket=bucket, Prefix="velib/history/"):
-            for obj in page.get("Contents", []):
-                keys.append(obj["Key"])
+    status = get_lake_status()
+    if not status.get("available"):
+        st.sidebar.warning("Inaccessible ou vide — mode temps réel seul.")
+        return
 
-        st.sidebar.info(f"{len(keys)} snapshots en S3")
-
-        if not keys:
-            return
-
-        action = st.sidebar.selectbox(
-            "Action",
-            ["Choisir", "Supprimer les plus anciens", "Tout supprimer"],
-            key="snapshot_action",
-        )
-
-        def _clear_ai_state():
-            try:
-                from src.ai.vector_store import _get_qdrant_client, COLLECTION_NAME
-                client = _get_qdrant_client()
-                if client:
-                    client.delete_collection(COLLECTION_NAME)
-            except Exception:
-                pass
-            st.cache_data.clear()
-            for key in ["rag_engine", "rag_docs", "rag_documents", "qdrant_client", "qdrant_docs"]:
-                if key in st.session_state:
-                    del st.session_state[key]
-
-        if action == "Supprimer les plus anciens":
-            n = st.sidebar.number_input(
-                "Garder les N derniers",
-                min_value=1,
-                max_value=len(keys),
-                value=min(24, len(keys)),
-            )
-            if st.sidebar.button("Supprimer", type="secondary"):
-                to_delete = sorted(keys)[:-n]
-                for key in to_delete:
-                    s3.delete_object(Bucket=bucket, Key=key)
-                st.sidebar.success(f"{len(to_delete)} snapshots supprimes")
-                _clear_ai_state()
-                st.rerun()
-
-        elif action == "Tout supprimer":
-            if st.sidebar.button("Confirmer suppression totale", type="secondary"):
-                for key in keys:
-                    s3.delete_object(Bucket=bucket, Key=key)
-                st.sidebar.success("Tous les snapshots supprimes")
-                _clear_ai_state()
-                st.rerun()
-
-    except Exception as e:
-        st.sidebar.error(f"Erreur : {e}")
+    st.sidebar.success(
+        f"{status['snapshots']} snapshots — dernier à "
+        f"{status['last_snapshot']:%H:%M} ({status['last_ingested_by']})"
+    )
 
 def _render_unified_assistant_content(df_filtered):
     st.info(
@@ -696,17 +618,11 @@ def _render_unified_assistant_content(df_filtered):
 
     qdrant_client, _ = _get_qdrant_client_cached()
 
-    if "rag_documents" not in st.session_state:
-        try:
-            with st.spinner("Chargement de l'index RAG historique..."):
-                from src.ai.rag import build_rag_index
-
-                docs, n_docs = build_rag_index()
-                st.session_state.rag_documents = docs
-                st.session_state.rag_docs = n_docs
-        except Exception:
-            st.session_state.rag_documents = None
-            st.session_state.rag_docs = 0
+    try:
+        _ensure_rag_documents()
+    except Exception:
+        st.session_state.rag_documents = None
+        st.session_state.rag_docs = 0
 
     if "unified_messages" not in st.session_state:
         st.session_state.unified_messages = []
