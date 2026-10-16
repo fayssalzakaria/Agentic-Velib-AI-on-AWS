@@ -10,5 +10,6 @@ RUN python -m venv /opt/velib-venv \
 
 USER airflow
 COPY --chown=airflow pipeline/requirements.txt /tmp/pipeline-requirements.txt
-RUN /opt/velib-venv/bin/pip install --no-cache-dir -r /tmp/pipeline-requirements.txt
+# pendulum : Airflow le cherche dans le venv avant chaque tâche external_python
+RUN /opt/velib-venv/bin/pip install --no-cache-dir -r /tmp/pipeline-requirements.txt pendulum
 RUN pip install --no-cache-dir "apache-airflow==3.3.2" "astronomer-cosmos==1.15.1"
