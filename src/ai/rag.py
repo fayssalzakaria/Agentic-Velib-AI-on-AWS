@@ -73,16 +73,14 @@ def _bm25_search(query: str, documents: list[dict], top_k: int = 20) -> list[tup
 
 def _cosine_search(query_expanded, documents, top_k=20):
     try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        query_embedding = model.encode([query_expanded], show_progress_bar=False)[0]
+        from src.ai.embeddings import embed_passages, embed_query
+        query_embedding = embed_query(query_expanded)
 
         # Utilise les embeddings precalcules si disponibles
         if documents and "embedding" in documents[0]:
             corpus_embeddings = np.array([d["embedding"] for d in documents])
         else:
-            corpus_texts = [doc["text"] for doc in documents]
-            corpus_embeddings = model.encode(corpus_texts, show_progress_bar=False)
+            corpus_embeddings = embed_passages([doc["text"] for doc in documents])
 
         norms = np.linalg.norm(corpus_embeddings, axis=1)
         norm_query = np.linalg.norm(query_embedding)
@@ -135,12 +133,12 @@ def _mmr_rerank(
     lambda_param : 1.0 = pertinence pure, 0.0 = diversité pure
     """
     try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
         candidate_indices = [idx for idx, _ in candidates[:30]]
-        candidate_texts = [documents[i]["text"] for i in candidate_indices]
-        candidate_embeddings = model.encode(candidate_texts, show_progress_bar=False)
+        if all("embedding" in documents[i] for i in candidate_indices):
+            candidate_embeddings = np.array([documents[i]["embedding"] for i in candidate_indices])
+        else:
+            from src.ai.embeddings import embed_passages
+            candidate_embeddings = embed_passages([documents[i]["text"] for i in candidate_indices])
 
         selected = []
         remaining = list(range(len(candidate_indices)))
@@ -314,9 +312,8 @@ def hybrid_search(
     # Étape 5 — MMR
     if use_mmr:
         try:
-            from sentence_transformers import SentenceTransformer
-            model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-            query_embedding = model.encode([expanded_query], show_progress_bar=False)[0]
+            from src.ai.embeddings import embed_query
+            query_embedding = embed_query(expanded_query)
             mmr_indices = _mmr_rerank(query_embedding, fused, documents, top_k=min(15, len(fused)))
             candidates = [documents[i] for i in mmr_indices]
             trace["mmr_selected"] = [d["metadata"]["station"] for d in candidates[:5]]
@@ -352,9 +349,8 @@ def build_rag_index(profiles: pd.DataFrame = None):
         return None, 0
 
     try:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        embeddings = model.encode([d["text"] for d in documents], show_progress_bar=False)
+        from src.ai.embeddings import embed_passages
+        embeddings = embed_passages([d["text"] for d in documents])
         for doc, embedding in zip(documents, embeddings):
             doc["embedding"] = embedding
     except Exception:

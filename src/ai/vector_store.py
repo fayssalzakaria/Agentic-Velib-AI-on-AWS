@@ -58,7 +58,7 @@ def build_qdrant_index(profiles: pd.DataFrame = None):
     """
     try:
         from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
-        from sentence_transformers import SentenceTransformer
+        from src.ai.embeddings import EMBEDDING_MODEL, embed_passages
         from src.ai.profile_docs import profiles_version, station_documents
         from src.data.lake import station_period_profiles
 
@@ -68,10 +68,11 @@ def build_qdrant_index(profiles: pd.DataFrame = None):
 
         if profiles is None or profiles.empty:
             profiles = station_period_profiles()
-        version = profiles_version(profiles)
+        # Changer de modèle d'embeddings impose aussi de réindexer
+        version = f"{profiles_version(profiles)}|{EMBEDDING_MODEL}"
 
         if _collection_exists(client):
-            if not version or _indexed_version(client) == version:
+            if not profiles_version(profiles) or _indexed_version(client) == version:
                 return client, _collection_count(client)
             client.delete_collection(COLLECTION_NAME)
 
@@ -89,8 +90,7 @@ def build_qdrant_index(profiles: pd.DataFrame = None):
             field_schema=PayloadSchemaType.KEYWORD,
         )
 
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        embeddings = model.encode([d["text"] for d in documents], show_progress_bar=False)
+        embeddings = embed_passages([d["text"] for d in documents])
 
         points = [
             PointStruct(
@@ -115,10 +115,9 @@ def semantic_search(query: str, client, n_results: int = 8) -> list:
         return []
 
     try:
-        from sentence_transformers import SentenceTransformer
+        from src.ai.embeddings import embed_query
 
-        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-        query_embedding = model.encode(query).tolist()
+        query_embedding = embed_query(query).tolist()
 
         station = extract_station_from_query(query, client)
 

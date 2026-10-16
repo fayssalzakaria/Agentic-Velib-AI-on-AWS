@@ -344,6 +344,7 @@ def render_lake_panel():
 
     if st.button("Rafraichir l'historique"):
         st.cache_data.clear()
+        _shared_rag_index.clear()
         _reset_ai_state()
         st.rerun()
 
@@ -372,11 +373,17 @@ def _get_qdrant_client_cached():
     return st.session_state.get("qdrant_client"), st.session_state.get("qdrant_docs", 0)
 
 
+@st.cache_resource(ttl=3600, show_spinner=False)
+def _shared_rag_index():
+    """Index RAG (documents + embeddings) partagé entre toutes les sessions, reconstruit au plus 1x/h."""
+    from src.ai.rag import build_rag_index
+    return build_rag_index()
+
+
 def _ensure_rag_documents():
     if "rag_documents" not in st.session_state:
         with st.spinner("Chargement des profils de stations (gold)..."):
-            from src.ai.rag import build_rag_index
-            docs, n_docs = build_rag_index()
+            docs, n_docs = _shared_rag_index()
             st.session_state.rag_documents = docs
             st.session_state.rag_docs = n_docs
     return st.session_state.rag_documents
@@ -400,6 +407,7 @@ def _render_rag_content(df_filtered=None):
             )
         with col2:
             if st.button("Rafraichir index"):
+                _shared_rag_index.clear()
                 for key in ["rag_documents", "rag_docs"]:
                     if key in st.session_state:
                         del st.session_state[key]
