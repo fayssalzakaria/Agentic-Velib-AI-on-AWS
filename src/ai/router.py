@@ -4,7 +4,7 @@ router.py — Routage automatique des questions utilisateur
 
 from llm_client import call_llm_json
 from src.ai.prompts import ROUTER_PROMPT
-from src.ai.nlp_utils import extract_keywords, detect_time_expression
+from src.ai.nlp_utils import detect_time_expression, extract_keywords, parse_time_target
 
 KEYWORDS_REALTIME = [
     "maintenant",
@@ -86,7 +86,13 @@ KEYWORDS_FORECAST = [
     "prédire",
     "predire",
     "sera vide",
+    "sera pleine",
     "sera-t-elle vide",
+    "sera-t-elle pleine",
+    "va être pleine",
+    "va se remplir",
+    "trouverai",
+    "pourrai",
     "va être vide",
     "va se vider",
     "bientôt vide",
@@ -134,6 +140,10 @@ def classify_question_rule_based(question: str) -> dict:
 
     if not now and (found := _matched(q, KEYWORDS_HABIT)):
         return _route("historical", "habitude", found, "La question porte sur une habitude ou une tendance.")
+
+    if not now and (target := parse_time_target(question)):
+        return _route("forecast", "prévision", [f"{k} = {v}" for k, v in target.items()],
+                      "La question vise une heure à venir.")
 
     if found := _matched(q, KEYWORDS_ANOMALY):
         return _route("anomaly", "anomalie", found, "La question mentionne des anomalies ou des stations critiques.")

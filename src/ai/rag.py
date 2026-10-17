@@ -335,7 +335,7 @@ def hybrid_search(
 
 
 def load_precomputed_documents() -> list[dict]:
-    """Documents + vecteurs calculés chaque nuit par le pipeline (gold/station_profile_embeddings)."""
+    """Documents + vecteurs calculés chaque jour par le pipeline (gold/station_profile_embeddings)."""
     from src.ai.embeddings import EMBEDDING_MODEL
     from src.ai.profile_docs import documents_from_frame
     from src.data.lake import station_embeddings

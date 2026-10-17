@@ -137,7 +137,7 @@ def latest_snapshot() -> pd.DataFrame:
 
 
 def station_period_profiles() -> pd.DataFrame:
-    """Profils gold par station / type de jour / période (construits par dbt chaque nuit)."""
+    """Profils gold par station / type de jour / période (construits par dbt chaque jour)."""
     return query(f"SELECT * FROM {_gold('gold_station_period_profile')}")
 
 

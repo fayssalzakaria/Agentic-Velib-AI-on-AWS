@@ -234,9 +234,12 @@ def _run_assistant(
             tool_outputs["semantic_search"] = semantic_result
 
         elif intent == "forecast":
+            from src.ai.nlp_utils import parse_time_target
+
             station = _extract_possible_station(question, df)
+            target = parse_time_target(question) or {"hours_ahead": 1}
             trace.tools_used.append("forecast_station")
-            tool_outputs["forecast_station"] = forecast_tool(station)
+            tool_outputs["forecast_station"] = forecast_tool(station, **target)
 
         elif intent == "report":
             stats = get_network_stats_tool(df)

@@ -108,10 +108,25 @@ def test_fallback_ingest_skips_when_primary_already_ran(tmp_path, monkeypatch):
     ("Génère un rapport PDF", "report"),
     ("Bastille sera vide dans une heure ?", "forecast"),
     ("Quel est le risque à Nation ?", "forecast"),
+    ("Est-ce que je trouverai un vélo à Nation à 18h ?", "forecast"),
+    ("République sera pleine dans 3 heures ?", "forecast"),
+    ("Bastille est-elle souvent vide à 18h ?", "historical"),
 ])
 def test_router_intents(question, intent):
     from src.ai.router import classify_question_rule_based
     assert classify_question_rule_based(question)["intent"] == intent
+
+
+@pytest.mark.parametrize("question, expected", [
+    ("Nation dans 3 h ?", {"hours_ahead": 3}),
+    ("et dans deux heures ?", {"hours_ahead": 2}),
+    ("Un vélo à Bastille à 18h ?", {"at_hour": 18}),
+    ("vers 7 h demain", {"at_hour": 7}),
+    ("Bastille est vide ?", {}),
+])
+def test_parse_time_target(question, expected):
+    from src.ai.nlp_utils import parse_time_target
+    assert parse_time_target(question) == expected
 
 
 def test_search_stations_ignores_accents_order_and_punctuation():

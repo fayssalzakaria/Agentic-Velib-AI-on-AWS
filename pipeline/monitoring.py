@@ -4,7 +4,7 @@ monitoring.py — Suivi du modèle de prévision en production.
 Chaque heure (après l'ingestion) : la prévision de l'heure suivante est enregistrée avec ses
 features dans lake/monitoring/predictions (Delta).
 
-Chaque nuit : les prévisions sont comparées à ce qui s'est réellement passé, puis écrites dans le gold :
+Chaque jour : les prévisions sont comparées à ce qui s'est réellement passé, puis écrites dans le gold :
 - model_monitoring_daily : AUC, Brier, risque moyen prédit vs taux de vide observé, par jour et par version
 - model_calibration      : quand le modèle annonce 30 %, la station est-elle vide 30 % du temps ?
 - model_drift            : dérive des features (PSI) entre la production récente et l'entraînement
@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 PSI_WARNING, PSI_ALERT = 0.1, 0.25
 # Exclues du calcul de dérive : sur une fenêtre de 24 h, le calendrier ne couvre qu'un ou deux jours
 # (différent de l'entraînement par construction) et past_n augmente mécaniquement avec le temps.
-DRIFT_EXCLUDED = {"hour_next", "weekday_next", "is_weekend_next", "is_public_holiday", "is_school_holiday", "past_n"}
+DRIFT_EXCLUDED = {"horizon", "hour_target", "weekday_target", "is_weekend_target",
+                  "is_public_holiday", "is_school_holiday", "past_n"}
 
 
 def predictions_uri() -> str:
@@ -34,8 +35,11 @@ def predictions_uri() -> str:
 
 # ---------------------------------------------------------------- chaque heure
 
+PREDICTION_COLUMNS = ["risk_empty", "risk_full", "bikes_q10", "bikes_q50", "bikes_q90"]
+
+
 def log_predictions() -> int:
-    """Enregistre la prévision de l'heure suivante (si un modèle est publié). Renvoie le nombre de lignes."""
+    """Enregistre les prévisions de tous les horizons (si des modèles sont publiés). Renvoie le nombre de lignes."""
     import src.ml.forecast as forecast
     from src.ml.features import FEATURES
 
@@ -45,12 +49,11 @@ def log_predictions() -> int:
         logger.info(f"Pas de prévision à enregistrer : {info.get('reason')}")
         return 0
 
-    predicted_for = info["predicted_for"].tz_convert("UTC")
-    frame = predictions[["station_id", "risk", *FEATURES]].copy()
+    frame = predictions[["station_id", *PREDICTION_COLUMNS, *FEATURES]].copy()
     frame["snapshot_at"] = info["snapshot_at"].tz_convert("UTC")
-    frame["predicted_for"] = predicted_for
+    frame["predicted_for"] = predictions["ts_target"].dt.tz_convert("UTC")
     frame["model_version"] = info["model"]["version"]
-    frame["date"] = info["predicted_for"].strftime("%Y-%m-%d")
+    frame["date"] = info["snapshot_at"].strftime("%Y-%m-%d")
 
     uri, options = _delta_uri(predictions_uri()), delta_storage_options()
     table = pa.Table.from_pandas(frame, preserve_index=False)
@@ -60,17 +63,17 @@ def log_predictions() -> int:
     metrics = (
         DeltaTable(uri, storage_options=options)
         .merge(source=table, source_alias="s", target_alias="t",
-               predicate=f"t.date = '{frame['date'].iloc[0]}' AND t.predicted_for = s.predicted_for "
-                         "AND t.station_id = s.station_id")
+               predicate=f"t.date = '{frame['date'].iloc[0]}' AND t.snapshot_at = s.snapshot_at "
+                         "AND t.station_id = s.station_id AND t.horizon = s.horizon")
         .when_not_matched_insert_all()
         .execute()
     )
     inserted = int(metrics.get("num_target_rows_inserted", 0))
-    logger.info(f"Prévisions enregistrées pour {info['predicted_for']:%d/%m %H:%M} : {inserted} lignes")
+    logger.info(f"Prévisions enregistrées à partir du snapshot de {info['snapshot_at']:%d/%m %H:%M} : {inserted} lignes")
     return inserted
 
 
-# ---------------------------------------------------------------- chaque nuit
+# ---------------------------------------------------------------- chaque jour
 
 def psi(reference: dict, values: np.ndarray) -> float:
     """Population Stability Index entre la distribution d'entraînement et les valeurs récentes."""
@@ -87,29 +90,43 @@ def psi(reference: dict, values: np.ndarray) -> float:
 
 
 def _daily_metrics(scored: pd.DataFrame) -> pd.DataFrame:
-    from sklearn.metrics import brier_score_loss, roc_auc_score
+    """Par jour et par horizon : AUC vide/pleine, erreur sur les vélos, couverture de l'intervalle."""
+    from sklearn.metrics import roc_auc_score
+
+    def auc(y, p):
+        mask = ~np.isnan(p)
+        y, p = y[mask], p[mask]
+        return roc_auc_score(y, p) if len(y) and 0 < y.sum() < len(y) else np.nan
 
     rows = []
-    for (date, version), group in scored.groupby(["date", "model_version"]):
-        y, p = group["actual"].to_numpy(), group["risk"].to_numpy()
+    for (date, horizon, version), group in scored.groupby(["day", "horizon", "model_version"]):
+        bikes = group["actual_bikes"].to_numpy()
         rows.append({
-            "date": date, "model_version": version, "predictions": len(group),
-            "auc": roc_auc_score(y, p) if 0 < y.sum() < len(y) else np.nan,
-            "brier": brier_score_loss(y, p),
-            "mean_predicted_risk": p.mean(), "observed_empty_rate": y.mean(),
+            "date": date, "horizon": int(horizon), "model_version": version, "predictions": len(group),
+            "auc_empty": auc(group["actual_empty"].to_numpy(), group["risk_empty"].to_numpy(dtype=float)),
+            "auc_full": auc(group["actual_full"].to_numpy(), group["risk_full"].to_numpy(dtype=float)),
+            "mae_bikes": np.nanmean(np.abs(bikes - group["bikes_q50"].to_numpy(dtype=float))),
+            "coverage_80": np.nanmean((bikes >= group["bikes_q10"]) & (bikes <= group["bikes_q90"])),
+            "observed_empty_rate": group["actual_empty"].mean(),
         })
     return pd.DataFrame(rows)
 
 
 def _calibration(scored: pd.DataFrame, bins: int = 10) -> pd.DataFrame:
+    """Risque annoncé vs fréquence observée (vide et pleine), sur les 7 derniers jours."""
     recent = scored[scored["predicted_for"] >= scored["predicted_for"].max() - pd.Timedelta(days=7)]
-    bucket = np.minimum((recent["risk"] * bins).astype(int), bins - 1)
-    return (
-        recent.assign(bucket=bucket)
-        .groupby("bucket")
-        .agg(mean_predicted=("risk", "mean"), observed_rate=("actual", "mean"), predictions=("risk", "size"))
-        .reset_index()
-    )
+    frames = []
+    for family, risk, actual in (("vide", "risk_empty", "actual_empty"), ("pleine", "risk_full", "actual_full")):
+        part = recent.dropna(subset=[risk])
+        if part.empty:
+            continue
+        bucket = np.minimum((part[risk] * bins).astype(int), bins - 1)
+        frames.append(
+            part.assign(bucket=bucket).groupby("bucket")
+            .agg(mean_predicted=(risk, "mean"), observed_rate=(actual, "mean"), predictions=(risk, "size"))
+            .reset_index().assign(question=family)
+        )
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def _drift(predictions: pd.DataFrame, reference: dict) -> pd.DataFrame:
@@ -146,12 +163,15 @@ def evaluate_production(silver: pd.DataFrame | None = None) -> dict:
     predictions["predicted_for"] = pd.to_datetime(predictions["predicted_for"], utc=True)
 
     silver = _read_silver() if silver is None else silver
-    actual = silver[["station_id", "ingested_at", "is_empty"]].rename(
-        columns={"ingested_at": "predicted_for", "is_empty": "actual"})
-    actual["predicted_for"] = pd.to_datetime(actual["predicted_for"], utc=True)
-    actual["station_id"] = actual["station_id"].astype(str)
+    actual = pd.DataFrame({
+        "station_id": silver["station_id"].astype(str),
+        "predicted_for": pd.to_datetime(silver["ingested_at"], utc=True),
+        "actual_empty": (silver["numbikesavailable"] == 0).astype(float),
+        "actual_full": (silver["numdocksavailable"] == 0).astype(float),
+        "actual_bikes": silver["numbikesavailable"].astype(float),
+    })
     scored = predictions.merge(actual, on=["station_id", "predicted_for"], how="inner")
-    scored["actual"] = scored["actual"].astype(float)
+    scored["day"] = scored["predicted_for"].dt.tz_convert("Europe/Paris").dt.strftime("%Y-%m-%d")
     if scored.empty:
         return {"status": "skipped", "reason": "aucune prévision dont l'heure est passée"}
 
@@ -167,7 +187,8 @@ def evaluate_production(silver: pd.DataFrame | None = None) -> dict:
     result = {
         "status": "evaluated",
         "scored_predictions": len(scored),
-        "last_day_auc": None if daily.empty else round(float(daily.iloc[-1]["auc"]), 4),
+        "last_day_auc_empty_1h": None if daily.empty else round(float(
+            daily[daily["horizon"] == 1]["auc_empty"].iloc[-1]), 4) if (daily["horizon"] == 1).any() else None,
         "features_in_drift": drift[drift["status"] == "dérive"]["feature"].tolist() if not drift.empty else [],
     }
     logger.info(f"Monitoring : {result}")

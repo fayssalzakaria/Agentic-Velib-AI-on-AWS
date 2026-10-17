@@ -165,10 +165,10 @@ def semantic_search_tool(
     }
 
 
-def forecast_tool(station_name: str | None) -> dict:
-    """Risque de vide dans 1 h (modèle LightGBM publié dans le lakehouse)."""
+def forecast_tool(station_name: str | None, hours_ahead: int | None = None, at_hour: int | None = None) -> dict:
+    """Prévision de 1 à 6 h : risque vide / pleine, vélos attendus avec intervalle (modèles LightGBM)."""
     from src.ml.forecast import forecast_for_station
-    return forecast_for_station(station_name or "")
+    return forecast_for_station(station_name or "", hours_ahead=hours_ahead, at_hour=at_hour)
 
 
 def generate_report_tool(df: pd.DataFrame) -> dict:

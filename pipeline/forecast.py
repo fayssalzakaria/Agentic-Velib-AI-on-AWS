@@ -1,11 +1,16 @@
 """
-forecast.py — Entraînement du modèle « la station sera-t-elle vide dans 1 heure ? » (LightGBM).
+forecast.py — Entraînement des modèles de prévision (LightGBM), horizons de 1 à 6 heures.
+
+Trois questions, un modèle par question (l'horizon est une feature) :
+- vide  : la station sera-t-elle vide à t + h ?          classification
+- plein : la station sera-t-elle pleine à t + h ?        classification
+- vélos : combien de vélos à t + h ? (quantiles 10/50/90) régression quantile → valeur + intervalle
 
 1. features à partir de tout le silver (src/ml/features.py, partagé avec la prédiction)
-2. découpage dans le temps : entraînement < validation < test (jamais de mélange passé/futur)
+2. découpage dans le temps : entraînement < validation < test
 3. LightGBM avec early stopping sur la validation
-4. comparaison sur le test à deux baselines : persistance et profil habituel de la station
-5. publication (latest.json) seulement si le modèle bat les deux baselines
+4. évaluation par horizon face à deux baselines : persistance et habitudes de la station
+5. chaque question est publiée seulement si son modèle bat les baselines
 
     python -m pipeline.run forecast
 """
@@ -22,13 +27,15 @@ from pipeline.settings import delta_storage_options, silver_uri
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "forecast_empty_1h"
+MODEL_NAME = "forecast"
 MIN_DAYS = int(os.environ.get("FORECAST_MIN_DAYS", 14))
 TEST_SHARE, VALID_SHARE = 0.2, 0.15
 TOP_K = 20
+QUANTILES = (0.1, 0.5, 0.9)
+# Au-delà, on échantillonne les instants par horizon pour garder la mémoire raisonnable
+MAX_ROWS_PER_HORIZON = 600_000
 
-PARAMS = {
-    "objective": "binary",
+BASE_PARAMS = {
     "learning_rate": 0.05,
     "num_leaves": 31,
     "min_child_samples": 50,
@@ -60,35 +67,6 @@ def _time_split(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.Data
     )
 
 
-def _precision_at_k(test: pd.DataFrame, scores: np.ndarray, k: int = TOP_K) -> float:
-    """
-    Usage opérateur : à chaque snapshot, parmi les stations NON vides, les k jugées les plus à
-    risque sont-elles vraiment vides 1 h plus tard ? Moyenne sur les snapshots du test.
-    """
-    frame = test.assign(score=scores)
-    frame = frame[frame["is_empty_now"] == 0]
-    hits = [
-        group.nlargest(k, "score")["empty_next"].mean()
-        for _, group in frame.groupby("ts")
-        if len(group) >= k
-    ]
-    return float(np.mean(hits)) if hits else float("nan")
-
-
-def _evaluate(name: str, test: pd.DataFrame, scores: np.ndarray) -> dict:
-    from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
-
-    y = test["empty_next"].to_numpy()
-    probas = np.clip(scores, 0, 1)
-    return {
-        "name": name,
-        "auc": round(float(roc_auc_score(y, scores)), 4),
-        "average_precision": round(float(average_precision_score(y, scores)), 4),
-        "brier": round(float(brier_score_loss(y, probas)), 4),
-        f"precision_at_{TOP_K}": round(_precision_at_k(test, scores), 4),
-    }
-
-
 def reference_distribution(frame: pd.DataFrame, features: list[str], bins: int = 10) -> dict:
     """
     Distribution de chaque feature sur le jeu d'entraînement (déciles) : sert de référence
@@ -107,12 +85,114 @@ def reference_distribution(frame: pd.DataFrame, features: list[str], bins: int =
     return reference
 
 
-def train_forecast(silver: pd.DataFrame | None = None, weather: pd.DataFrame | None = None,
-                   school: pd.DataFrame | None = None) -> dict:
+# ---------------------------------------------------------------- métriques
+
+def _precision_at_k(test: pd.DataFrame, target: str, now: str, scores: np.ndarray, k: int = TOP_K) -> float:
+    """
+    Usage opérateur : à chaque snapshot et horizon, parmi les stations pas encore dans l'état visé,
+    les k jugées les plus à risque y sont-elles vraiment ? Moyenne sur les snapshots du test.
+    """
+    frame = test.assign(score=scores)
+    frame = frame[frame[now] == 0]
+    hits = [group.nlargest(k, "score")[target].mean()
+            for _, group in frame.groupby(["ts", "horizon"]) if len(group) >= k]
+    return float(np.mean(hits)) if hits else float("nan")
+
+
+def _classification_metrics(test: pd.DataFrame, target: str, now: str, scores: np.ndarray) -> dict:
+    from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
+
+    y = test[target].to_numpy()
+    brier = round(float(brier_score_loss(y, np.clip(scores, 0, 1))), 4)
+    if y.min() == y.max():  # une seule classe sur la période : AUC non définie
+        return {"auc": float("nan"), "average_precision": float("nan"), "brier": brier,
+                f"precision_at_{TOP_K}": float("nan")}
+    return {
+        "auc": round(float(roc_auc_score(y, scores)), 4),
+        "average_precision": round(float(average_precision_score(y, scores)), 4),
+        "brier": brier,
+        f"precision_at_{TOP_K}": round(_precision_at_k(test, target, now, scores), 4),
+    }
+
+
+def _regression_metrics(y: np.ndarray, median: np.ndarray, low=None, high=None) -> dict:
+    metrics = {"mae": round(float(np.mean(np.abs(y - median))), 3)}
+    if low is not None:
+        metrics["coverage_80"] = round(float(np.mean((y >= low) & (y <= high))), 3)
+        metrics["interval_width"] = round(float(np.mean(high - low)), 2)
+    return metrics
+
+
+def _by_horizon(test: pd.DataFrame, compute) -> dict:
+    """Une métrique globale + la même métrique pour chaque horizon."""
+    result = {"all": compute(test)}
+    for h, group in test.groupby("horizon"):
+        result[f"{int(h)}h"] = compute(group)
+    return result
+
+
+# ---------------------------------------------------------------- entraînement
+
+def _fit(model, train, valid, target, features):
     import lightgbm as lgb
 
+    model.fit(train[features], train[target], eval_X=valid[features], eval_y=valid[target],
+              callbacks=[lgb.early_stopping(50, verbose=False)])
+    return model
+
+
+def _train_classifier(name, train, valid, test, features, profile_col):
+    """Vide ou plein : modèle + baselines (persistance, habitudes de la station), par horizon."""
+    import lightgbm as lgb
+
+    from src.ml.features import TARGETS
+
+    target, now = TARGETS[name], f"is_{name}_now"
+    model = _fit(lgb.LGBMClassifier(objective="binary", **BASE_PARAMS), train, valid, target, features)
+    base_rate = float(train[target].mean())
+    scorers = {
+        "model": lambda d: model.predict_proba(d[features])[:, 1],
+        "persistence": lambda d: d[now].to_numpy(),
+        "profile": lambda d: d[profile_col].fillna(base_rate).to_numpy(),
+    }
+    evaluation = {key: _by_horizon(test, lambda d, f=f: _classification_metrics(d, target, now, f(d)))
+                  for key, f in scorers.items()}
+    best_baseline = max(evaluation["persistence"]["all"]["auc"], evaluation["profile"]["all"]["auc"])
+    promoted = (evaluation["model"]["all"]["auc"] > best_baseline
+                and evaluation["model"]["all"]["brier"] < evaluation["profile"]["all"]["brier"])
+    return {"models": {"model": model}, "evaluation": evaluation, "promoted": bool(promoted),
+            "base_rate": round(base_rate, 4), "best_iteration": int(model.best_iteration_ or 0)}
+
+
+def _train_bikes(train, valid, test, features):
+    """Nombre de vélos : trois quantiles (intervalle de 80 %) + baselines sur la médiane."""
+    import lightgbm as lgb
+
+    from src.ml.features import TARGETS
+
+    target = TARGETS["bikes"]
+    models = {f"q{int(q * 100)}": _fit(lgb.LGBMRegressor(objective="quantile", alpha=q, **BASE_PARAMS),
+                                       train, valid, target, features) for q in QUANTILES}
+
+    def model_metrics(d):
+        low, med, high = (np.clip(models[k].predict(d[features]), 0, None) for k in ("q10", "q50", "q90"))
+        return _regression_metrics(d[target].to_numpy(), med, np.minimum(low, med), np.maximum(high, med))
+
+    evaluation = {
+        "model": _by_horizon(test, model_metrics),
+        "persistence": _by_horizon(test, lambda d: _regression_metrics(d[target].to_numpy(), d["bikes"].to_numpy())),
+        "profile": _by_horizon(test, lambda d: _regression_metrics(
+            d[target].to_numpy(), d["past_mean_bikes"].fillna(d["bikes"]).to_numpy())),
+    }
+    best_baseline = min(evaluation["persistence"]["all"]["mae"], evaluation["profile"]["all"]["mae"])
+    return {"models": models, "evaluation": evaluation,
+            "promoted": bool(evaluation["model"]["all"]["mae"] < best_baseline)}
+
+
+def train_forecast(silver: pd.DataFrame | None = None, weather: pd.DataFrame | None = None,
+                   school: pd.DataFrame | None = None) -> dict:
     from pipeline.external import read_school_holidays, read_weather
-    from src.ml.features import FEATURES, LABEL, training_frame
+    from src.ml.features import FEATURES, HORIZONS, TARGETS, training_frame
     from src.ml.storage import model_uri, write_json, write_text
 
     silver = _read_silver() if silver is None else silver
@@ -120,69 +200,55 @@ def train_forecast(silver: pd.DataFrame | None = None, weather: pd.DataFrame | N
     school = read_school_holidays() if school is None else school
     days = silver["date"].nunique() if "date" in silver else silver["ingested_at"].dt.date.nunique()
     if days < MIN_DAYS:
-        result = {"status": "skipped", "reason": f"{days} jour{'s' if days > 1 else ''} d'historique sur {MIN_DAYS} requis", "days": int(days)}
-        logger.info(f"Modèle non entraîné : {result['reason']}")
+        result = {"status": "skipped", "days": int(days),
+                  "reason": f"{days} jour{'s' if days > 1 else ''} d'historique sur {MIN_DAYS} requis"}
+        logger.info(f"Modèles non entraînés : {result['reason']}")
         write_json(model_uri(MODEL_NAME, "status.json"), {**result, "checked_at": datetime.now(timezone.utc)})
         return result
 
-    data = training_frame(silver, weather, school).dropna(subset=[LABEL])
+    sample = min(1.0, MAX_ROWS_PER_HORIZON / len(silver))
+    data = training_frame(silver, weather, school, sample=sample).dropna(subset=list(TARGETS.values()))
     train, valid, test = _time_split(data)
-    logger.info(f"Jeu d'entraînement : {len(train):,} / validation : {len(valid):,} / test : {len(test):,} lignes")
+    logger.info(f"{len(HORIZONS)} horizons — entraînement {len(train):,} / validation {len(valid):,} / test {len(test):,} lignes")
 
-    model = lgb.LGBMClassifier(**PARAMS)
-    model.fit(
-        train[FEATURES], train[LABEL],
-        eval_X=valid[FEATURES],
-        eval_y=valid[LABEL],
-        eval_metric="binary_logloss",
-        callbacks=[lgb.early_stopping(50, verbose=False)],
-    )
-    scores = model.predict_proba(test[FEATURES])[:, 1]
-
-    base_rate = float(train[LABEL].mean())
     results = {
-        "model": _evaluate("LightGBM", test, scores),
-        "persistence": _evaluate("Persistance (vide maintenant)", test, test["is_empty_now"].to_numpy()),
-        "profile": _evaluate("Profil habituel de la station", test, test["past_rate_empty"].fillna(base_rate).to_numpy()),
+        "empty": _train_classifier("empty", train, valid, test, FEATURES, "past_rate_empty"),
+        "full": _train_classifier("full", train, valid, test, FEATURES, "past_rate_full"),
+        "bikes": _train_bikes(train, valid, test, FEATURES),
     }
-    best_baseline_auc = max(results["persistence"]["auc"], results["profile"]["auc"])
-    promoted = (results["model"]["auc"] > best_baseline_auc
-                and results["model"]["brier"] < results["profile"]["brier"])
 
     version = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    importance = dict(sorted(
-        zip(FEATURES, model.booster_.feature_importance(importance_type="gain").round(1).tolist()),
-        key=lambda item: -item[1],
-    ))
+    for family, result in results.items():
+        for key, model in result["models"].items():
+            write_text(model_uri(MODEL_NAME, version, f"{family}_{key}.txt"), model.booster_.model_to_string())
+
+    importance = results["empty"]["models"]["model"].booster_.feature_importance(importance_type="gain")
     metrics = {
         "model_name": MODEL_NAME,
         "version": version,
         "trained_at": datetime.now(timezone.utc),
-        "promoted": promoted,
-        "horizon": "1 heure",
+        "horizons": list(HORIZONS),
         "days_of_history": int(days),
         "rows": {"train": len(train), "valid": len(valid), "test": len(test)},
         "test_period": [test["ts"].min(), test["ts"].max()],
-        "base_rate_empty": round(base_rate, 4),
-        "best_iteration": int(model.best_iteration_ or PARAMS["n_estimators"]),
         "features": FEATURES,
-        "feature_importance_gain": importance,
-        "evaluation": results,
+        "families": {
+            family: {k: v for k, v in result.items() if k != "models"} | {"files": sorted(result["models"])}
+            for family, result in results.items()
+        },
+        "promoted": [family for family, result in results.items() if result["promoted"]],
+        "feature_importance_gain": dict(sorted(zip(FEATURES, importance.round(1).tolist()), key=lambda i: -i[1])),
         "external_data": {"weather": weather is not None, "school_holidays": school is not None},
         "reference_distribution": reference_distribution(train, FEATURES),
     }
-
-    write_text(model_uri(MODEL_NAME, version, "model.txt"), model.booster_.model_to_string())
     write_json(model_uri(MODEL_NAME, version, "metrics.json"), metrics)
-    if promoted:
+    if metrics["promoted"]:
         write_json(model_uri(MODEL_NAME, "latest.json"), metrics)
-    write_json(model_uri(MODEL_NAME, "status.json"),
-               {"status": "trained", "version": version, "promoted": promoted, "checked_at": datetime.now(timezone.utc)})
+    write_json(model_uri(MODEL_NAME, "status.json"), {"status": "trained", "version": version,
+                                                      "promoted": metrics["promoted"],
+                                                      "checked_at": datetime.now(timezone.utc)})
 
-    logger.info(
-        f"Modèle {version} : AUC {results['model']['auc']} "
-        f"(persistance {results['persistence']['auc']}, profil {results['profile']['auc']}) "
-        f"→ {'publié' if promoted else 'NON publié (ne bat pas les baselines)'}"
-    )
-    return {"status": "trained", "version": version, "promoted": promoted,
-            "auc": results["model"]["auc"], "best_baseline_auc": best_baseline_auc}
+    summary = {family: {"score": r["evaluation"]["model"]["all"].get("auc", r["evaluation"]["model"]["all"].get("mae")),
+                        "publié": r["promoted"]} for family, r in results.items()}
+    logger.info(f"Modèles {version} : {summary}")
+    return {"status": "trained", "version": version, "promoted": metrics["promoted"], "summary": summary}

@@ -1,37 +1,40 @@
 """
-forecast.py — Prédiction « risque que la station soit vide dans 1 heure » (côté application et agent).
+forecast.py — Prévisions de 1 à 6 heures (côté application et agent) :
+risque d'être vide, risque d'être pleine, nombre de vélos avec un intervalle de 80 %.
 
-Le modèle publié est lu dans le registre du lakehouse ; les features du dernier snapshot du silver
-sont calculées par src/ml/features.py, exactement comme à l'entraînement.
+Les modèles publiés sont lus dans le registre du lakehouse ; les features du dernier snapshot du
+silver sont calculées par src/ml/features.py, exactement comme à l'entraînement.
 """
 import time
 
+import numpy as np
 import pandas as pd
 
 from src.data import lake
-from src.ml.features import FEATURES, HORIZON, PARIS_TZ, SILVER_COLUMNS, serving_frame
+from src.ml.features import FEATURES, HORIZONS, PARIS_TZ, SILVER_COLUMNS, serving_frame
 from src.ml.storage import model_uri, read_json, read_text
 
-MODEL_NAME = "forecast_empty_1h"
+MODEL_NAME = "forecast"
+MODEL_FILES = {"empty": ["model"], "full": ["model"], "bikes": ["q10", "q50", "q90"]}
 _CACHE_SECONDS = 600
 _cache: dict = {}
 
 
 def model_status() -> dict:
-    """Dernier entraînement (status.json) et modèle publié (latest.json), s'il existe."""
+    """Dernier entraînement (status.json) et modèles publiés (latest.json), s'ils existent."""
     return {
         "status": read_json(model_uri(MODEL_NAME, "status.json")) or {},
         "published": read_json(model_uri(MODEL_NAME, "latest.json")),
     }
 
 
-def _load_booster(version: str):
+def _booster(version: str, family: str, key: str):
     import lightgbm as lgb
 
-    key = ("booster", version)
-    if key not in _cache:
-        _cache[key] = lgb.Booster(model_str=read_text(model_uri(MODEL_NAME, version, "model.txt")))
-    return _cache[key]
+    cache_key = ("booster", version, family, key)
+    if cache_key not in _cache:
+        _cache[cache_key] = lgb.Booster(model_str=read_text(model_uri(MODEL_NAME, version, f"{family}_{key}.txt")))
+    return _cache[cache_key]
 
 
 def _snapshot(ts) -> pd.DataFrame:
@@ -51,34 +54,43 @@ def _compute_predictions() -> tuple[pd.DataFrame | None, dict]:
     if last.empty or pd.isna(last.loc[0, "ts"]):
         return None, {"reason": "Lakehouse vide ou inaccessible."}
     ts = pd.Timestamp(last.loc[0, "ts"]).tz_convert("UTC")
-    ts_next = ts + HORIZON
 
     current = _snapshot(ts)
     lag1, lag2 = _snapshot(ts - pd.Timedelta(hours=1)), _snapshot(ts - pd.Timedelta(hours=2))
+    target_hours = sorted({int((ts + pd.Timedelta(hours=h)).tz_convert(PARIS_TZ).hour) for h in HORIZONS})
     hour_stats = lake.query(
-        f"""SELECT station_id, count(*) AS past_n, sum(is_empty::int) AS past_empty
-            FROM {lake._silver()} WHERE hour = ? GROUP BY station_id""",
-        [int(ts_next.tz_convert(PARIS_TZ).hour)],
+        f"""SELECT station_id, hour, count(*) AS past_n, sum(is_empty::int) AS past_empty,
+                   sum(is_full::int) AS past_full, sum(numbikesavailable) AS past_bikes_sum
+            FROM {lake._silver()} WHERE hour IN ({", ".join("?" * len(target_hours))})
+            GROUP BY station_id, hour""",
+        target_hours,
     )
-
     weather = lake.query(
-        f"SELECT * FROM delta_scan('{lake.lake_root()}/silver/weather') WHERE ts = ?",
-        [ts_next.to_pydatetime()],
+        f"SELECT * FROM delta_scan('{lake.lake_root()}/silver/weather') WHERE ts > ? AND ts <= ?",
+        [ts.to_pydatetime(), (ts + pd.Timedelta(hours=max(HORIZONS))).to_pydatetime()],
     )
     school = lake.query(f"SELECT * FROM read_parquet('{lake.lake_root()}/silver/school_holidays.parquet')")
     frame = serving_frame(current, lag1, lag2, hour_stats,
                           weather if not weather.empty else None, school if not school.empty else None)
-    frame["risk"] = _load_booster(published["version"]).predict(frame[FEATURES])
-    info = {
-        "snapshot_at": ts.tz_convert(PARIS_TZ),
-        "predicted_for": ts_next.tz_convert(PARIS_TZ),
-        "model": published,
-    }
-    return frame.sort_values("risk", ascending=False).reset_index(drop=True), info
+
+    version, promoted = published["version"], set(published["promoted"])
+    X = frame[FEATURES]
+    frame["risk_empty"] = _booster(version, "empty", "model").predict(X) if "empty" in promoted else np.nan
+    frame["risk_full"] = _booster(version, "full", "model").predict(X) if "full" in promoted else np.nan
+    if "bikes" in promoted:
+        q10, q50, q90 = (np.clip(_booster(version, "bikes", q).predict(X), 0, None) for q in ("q10", "q50", "q90"))
+        frame["bikes_q50"] = q50
+        frame["bikes_q10"] = np.minimum(q10, q50)
+        frame["bikes_q90"] = np.minimum(np.maximum(q90, q50), frame["capacity"])
+    else:
+        frame[["bikes_q10", "bikes_q50", "bikes_q90"]] = np.nan
+
+    info = {"snapshot_at": ts.tz_convert(PARIS_TZ), "model": published, "horizons": list(HORIZONS)}
+    return frame.reset_index(drop=True), info
 
 
-def predict_next_hour() -> tuple[pd.DataFrame | None, dict]:
-    """Prédictions pour l'heure suivant le dernier snapshot (mises en cache 10 minutes)."""
+def predict() -> tuple[pd.DataFrame | None, dict]:
+    """Prévisions de tous les horizons pour le dernier snapshot (mises en cache 10 minutes)."""
     cached = _cache.get("predictions")
     if cached and time.time() - cached[0] < _CACHE_SECONDS:
         return cached[1]
@@ -90,28 +102,47 @@ def predict_next_hour() -> tuple[pd.DataFrame | None, dict]:
     return result
 
 
-def forecast_for_station(station_query: str) -> dict:
-    """Utilisé par l'IA : risque de vide dans 1 h pour les stations qui correspondent à la recherche."""
+def horizon_for(target_hour: int, snapshot_at: pd.Timestamp) -> int:
+    """« À 18h » → nombre d'heures après le dernier snapshot (le lendemain si l'heure est passée)."""
+    return (target_hour - snapshot_at.hour) % 24 or 24
+
+
+def forecast_for_station(station_query: str, hours_ahead: int | None = None, at_hour: int | None = None) -> dict:
+    """
+    Utilisé par l'IA : pour les stations qui correspondent à la recherche, risque d'être vide ou
+    pleine et nombre de vélos attendu (avec intervalle), à un horizon donné ou à tous.
+    """
     from src.data.filters import search_stations
 
-    predictions, info = predict_next_hour()
+    predictions, info = predict()
     if predictions is None:
         return {"error": info["reason"]}
-    matches = search_stations(predictions, station_query) if station_query else predictions.head(10)
+    if at_hour is not None:
+        hours_ahead = horizon_for(at_hour, info["snapshot_at"])
+    if hours_ahead is not None and hours_ahead not in info["horizons"]:
+        return {"error": f"Prévision possible de 1 à {max(info['horizons'])} h après le dernier snapshot "
+                         f"({info['snapshot_at']:%H:%M}) ; demandé : {hours_ahead} h."}
+
+    rows = predictions if hours_ahead is None else predictions[predictions["horizon"] == hours_ahead]
+    matches = search_stations(rows, station_query) if station_query else rows.nlargest(10, "risk_empty")
     if matches.empty:
         return {"error": f"Station '{station_query}' introuvable dans le dernier snapshot."}
-    evaluation = info["model"]["evaluation"]["model"]
+
+    pct = lambda v: None if pd.isna(v) else f"{v:.0%}"
     return {
-        "source": "modèle LightGBM (prévision)",
-        "prevision_pour": f"{info['predicted_for']:%d/%m %H:%M}",
+        "source": "modèles LightGBM (prévision)",
         "a_partir_du_snapshot_de": f"{info['snapshot_at']:%d/%m %H:%M}",
-        "fiabilite_modele": f"AUC {evaluation['auc']} sur la période de test",
-        "stations": [
+        "previsions": [
             {
                 "station": row.name,
+                "heure_visee": f"{row.ts_target.tz_convert(PARIS_TZ):%H:%M}",
+                "dans": f"{int(row.horizon)} h",
                 "velos_au_dernier_snapshot": int(row.bikes),
-                "risque_vide_dans_1h": f"{row.risk:.0%}",
+                "risque_vide": pct(row.risk_empty),
+                "risque_pleine": pct(row.risk_full),
+                "velos_attendus": None if pd.isna(row.bikes_q50) else
+                f"{row.bikes_q50:.0f} (entre {row.bikes_q10:.0f} et {row.bikes_q90:.0f})",
             }
-            for row in matches.head(10).itertuples()
+            for row in matches.sort_values(["name", "horizon"]).head(12).itertuples()
         ],
     }

@@ -182,14 +182,25 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "forecast_station",
-            "description": "Prevoir le risque qu'une station Velib soit vide dans l'heure a venir (modele LightGBM)",
+            "description": (
+                "Prevoir l'etat d'une station Velib dans 1 a 6 heures (modeles LightGBM) : risque d'etre vide, "
+                "risque d'etre pleine (plus de borne libre) et nombre de velos attendu avec un intervalle"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "station_name": {
                         "type": "string",
                         "description": "Nom ou partie du nom de la station (vide : stations les plus a risque)",
-                    }
+                    },
+                    "hours_ahead": {
+                        "type": "integer",
+                        "description": "Dans combien d'heures (1 a 6). A omettre si l'utilisateur donne une heure precise.",
+                    },
+                    "at_hour": {
+                        "type": "integer",
+                        "description": "Heure precise demandee (0-23), par exemple 18 pour « a 18h ».",
+                    },
                 },
                 "required": ["station_name"],
             },
@@ -253,7 +264,7 @@ AGENT_SYSTEM_PROMPT = (
     "d'une station, puis son historique pour dire si la situation est habituelle. "
     "État actuel et anomalies : get_station_info, get_network_stats, detect_anomalies. "
     "Habitudes et tendances : search_history. "
-    "Risque qu'une station soit vide dans l'heure à venir : forecast_station (modèle de prévision). "
+    "État d'une station dans 1 à 6 heures (vide, pleine, vélos attendus) : forecast_station. "
     "N'invente aucune donnée. Réponds en français, de façon concise ; "
     "quand tu listes des stations, cite les plus importantes (10 au maximum) et le nombre total."
 )
@@ -270,7 +281,8 @@ def _execute_tool(name: str, args: dict, df, qdrant_client, rag_documents) -> st
         return tool_detect_anomalies(df)
     if name == "forecast_station":
         from src.ml.forecast import forecast_for_station
-        return json.dumps(forecast_for_station(args.get("station_name", "")), ensure_ascii=False)
+        return json.dumps(forecast_for_station(args.get("station_name", ""), hours_ahead=args.get("hours_ahead"),
+                                               at_hour=args.get("at_hour")), ensure_ascii=False)
     return json.dumps({"error": f"Tool {name} inconnu"})
 
 

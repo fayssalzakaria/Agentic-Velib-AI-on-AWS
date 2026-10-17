@@ -61,3 +61,22 @@ def detect_time_expression(text: str) -> List[str]:
             expressions.append(keyword)
 
     return expressions
+
+
+_NUMBER_WORDS = {"une": 1, "un": 1, "deux": 2, "trois": 3, "quatre": 4, "cinq": 5, "six": 6}
+
+
+def parse_time_target(question: str) -> dict:
+    """
+    Horizon demandé dans la question :
+    « dans 3 h », « dans deux heures » → {"hours_ahead": 3} ; « à 18h », « vers 18 h 30 » → {"at_hour": 18}.
+    """
+    q = question.lower()
+    match = re.search(r"dans\s+(\d+|une|un|deux|trois|quatre|cinq|six)\s*(?:h\b|heures?)", q)
+    if match:
+        value = match.group(1)
+        return {"hours_ahead": int(value) if value.isdigit() else _NUMBER_WORDS[value]}
+    match = re.search(r"(?:à|a|vers)\s+(\d{1,2})\s*h", q)
+    if match and int(match.group(1)) < 24:
+        return {"at_hour": int(match.group(1))}
+    return {}
