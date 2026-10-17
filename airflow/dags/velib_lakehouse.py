@@ -2,7 +2,7 @@
 velib_lakehouse.py — DAGs Airflow 3 du lakehouse Vélib' (collecteur principal).
 
 - velib_ingest_hourly : API Vélib' -> bronze -> silver, toutes les heures à :05
-- velib_daily_gold    : OPTIMIZE + VACUUM silver, gold dbt (Cosmos), embeddings et modèle de prévision, à 02:15
+- velib_daily_gold    : OPTIMIZE + VACUUM silver, gold dbt (Cosmos), embeddings et modèle de prévision, à 13:15
 
 Le code métier est celui de pipeline/ (le même que GitHub Actions, collecteur de secours).
 Il tourne dans /opt/velib-venv via @task.external_python pour isoler ses dépendances
@@ -54,7 +54,8 @@ def velib_ingest_hourly():
 
 @dag(
     dag_id="velib_daily_gold",
-    schedule="15 2 * * *",
+    # En journée : le PC qui héberge Airflow est allumé (GitHub prend le relais le soir sinon)
+    schedule="15 13 * * *",
     start_date=START,
     catchup=False,
     max_active_runs=1,

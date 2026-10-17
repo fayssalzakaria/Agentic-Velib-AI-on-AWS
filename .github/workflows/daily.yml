@@ -1,12 +1,13 @@
 name: daily-fallback
 
 # Job quotidien de SECOURS : compaction Delta (OPTIMIZE + VACUUM), modèles gold dbt, puis embeddings.
-# Le principal est le DAG Airflow velib_daily_gold (02:15, heure de Paris), qui écrit
-# lake/_control/daily/<date>.json. Ici (06:30 à Paris) on ne relance rien si le marqueur existe.
+# Le principal est le DAG Airflow velib_daily_gold (13:15, heure de Paris), qui écrit
+# lake/_control/daily/<date>.json. Ici (21:30 à Paris en été, 20:30 en hiver : le cron GitHub est
+# en UTC) on ne relance rien si le marqueur existe.
 # Le gold n'est pas recalculé chaque heure pour limiter la sortie de données S3.
 on:
   schedule:
-    - cron: "30 4 * * *"
+    - cron: "30 19 * * *"
   workflow_dispatch:
     inputs:
       backfill:
