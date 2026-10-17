@@ -3,7 +3,6 @@ agent.py — Agent LangChain avec tools pour analyse Vélib'
 Commit 3 Phase ML : feat(ml): LangChain agent with custom tools
 """
 import os
-import io
 import json
 import pandas as pd
 import time
@@ -12,7 +11,6 @@ from llm_client import call_llm, track_usage, verify_relevance
 import pytz
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import Any
 
 @dataclass
 class AgentTrace:
@@ -32,7 +30,6 @@ class AgentTrace:
     usage: dict = field(default_factory=dict)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 PARIS_TZ = pytz.timezone("Europe/Paris")
 # Le LLM reçoit le nombre total + un échantillon : envoyer des centaines de noms coûte des tokens pour rien
 MAX_LISTED_STATIONS = 15
@@ -184,6 +181,23 @@ TOOLS_SCHEMA = [
     {
         "type": "function",
         "function": {
+            "name": "forecast_station",
+            "description": "Prevoir le risque qu'une station Velib soit vide dans l'heure a venir (modele LightGBM)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "station_name": {
+                        "type": "string",
+                        "description": "Nom ou partie du nom de la station (vide : stations les plus a risque)",
+                    }
+                },
+                "required": ["station_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_station_info",
             "description": "Obtenir les informations temps reel d'une station Velib specifique",
             "parameters": {
@@ -239,6 +253,7 @@ AGENT_SYSTEM_PROMPT = (
     "d'une station, puis son historique pour dire si la situation est habituelle. "
     "État actuel et anomalies : get_station_info, get_network_stats, detect_anomalies. "
     "Habitudes et tendances : search_history. "
+    "Risque qu'une station soit vide dans l'heure à venir : forecast_station (modèle de prévision). "
     "N'invente aucune donnée. Réponds en français, de façon concise ; "
     "quand tu listes des stations, cite les plus importantes (10 au maximum) et le nombre total."
 )
@@ -253,6 +268,9 @@ def _execute_tool(name: str, args: dict, df, qdrant_client, rag_documents) -> st
         return tool_search_history(args.get("query", ""), qdrant_client, rag_documents)
     if name == "detect_anomalies":
         return tool_detect_anomalies(df)
+    if name == "forecast_station":
+        from src.ml.forecast import forecast_for_station
+        return json.dumps(forecast_for_station(args.get("station_name", "")), ensure_ascii=False)
     return json.dumps({"error": f"Tool {name} inconnu"})
 
 

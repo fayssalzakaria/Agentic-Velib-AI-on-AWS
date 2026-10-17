@@ -74,6 +74,25 @@ KEYWORDS_NOW = [
     "aujourd'hui",
 ]
 
+# Question sur le futur proche : le modèle de prévision répond
+KEYWORDS_FORECAST = [
+    "dans une heure",
+    "dans 1h",
+    "dans 1 h",
+    "dans l'heure",
+    "prévision",
+    "prevision",
+    "prévoir",
+    "prédire",
+    "predire",
+    "sera vide",
+    "sera-t-elle vide",
+    "va être vide",
+    "va se vider",
+    "bientôt vide",
+    "risque",
+]
+
 KEYWORDS_REPORT = [
     "rapport",
     "bilan",
@@ -109,6 +128,9 @@ def classify_question_rule_based(question: str) -> dict:
 
     if found := _matched(q, KEYWORDS_REPORT):
         return _route("report", "rapport", found, "La question demande un rapport ou une synthèse.")
+
+    if found := _matched(q, KEYWORDS_FORECAST):
+        return _route("forecast", "prévision", found, "La question porte sur l'état de la station dans l'heure à venir.")
 
     if not now and (found := _matched(q, KEYWORDS_HABIT)):
         return _route("historical", "habitude", found, "La question porte sur une habitude ou une tendance.")
@@ -167,6 +189,7 @@ Question utilisateur :
             "historical",
             "semantic",
             "report",
+            "forecast",
             "general",
         }
 

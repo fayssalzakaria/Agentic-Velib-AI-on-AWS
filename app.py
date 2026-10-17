@@ -3,6 +3,7 @@ import streamlit as st
 from config import MODE_HISTORY
 from src.data.filters import apply_filters
 from src.ui.ai_panel import render_ai_tabs
+from src.ui.forecast_panel import render_forecast
 from src.ui.history import render_history_page
 from src.ui.ui import (
     handle_snapshot_refresh,
@@ -45,6 +46,7 @@ st.sidebar.info(f"{len(df_filtered)} stations après filtres")
 render_metrics(df_filtered)
 render_station_detail(df_filtered)
 render_map(df_filtered)
+render_forecast()
 render_charts(df_filtered)
 render_ai_tabs()
 render_downloads(df_filtered)

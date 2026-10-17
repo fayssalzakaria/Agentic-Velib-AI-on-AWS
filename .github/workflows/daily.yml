@@ -87,6 +87,10 @@ jobs:
           pip install -r pipeline/requirements-embed.txt
           python -m pipeline.run embed
 
+      - name: Entraînement du modèle de prévision (vide dans 1 h)
+        if: steps.check.outputs.skip != 'true'
+        run: python -m pipeline.run forecast
+
       - name: Marqueur de fin
         if: steps.check.outputs.skip != 'true'
         run: python -m pipeline.control mark-done daily

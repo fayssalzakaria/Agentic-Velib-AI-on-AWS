@@ -106,6 +106,8 @@ def test_fallback_ingest_skips_when_primary_already_ran(tmp_path, monkeypatch):
     ("Y a-t-il des anomalies ?", "anomaly"),
     ("Combien de vélos à Bastille en ce moment ?", "realtime"),
     ("Génère un rapport PDF", "report"),
+    ("Bastille sera vide dans une heure ?", "forecast"),
+    ("Quel est le risque à Nation ?", "forecast"),
 ])
 def test_router_intents(question, intent):
     from src.ai.router import classify_question_rule_based

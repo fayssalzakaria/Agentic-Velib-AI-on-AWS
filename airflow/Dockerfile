@@ -4,6 +4,9 @@
 FROM apache/airflow:3.3.2-python3.12
 
 USER root
+# libgomp1 : OpenMP, nécessaire à LightGBM
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+ && rm -rf /var/lib/apt/lists/*
 RUN python -m venv /opt/velib-venv \
  && mkdir -p /opt/airflow/dbt_state /home/airflow/.cache/huggingface \
  && chown -R airflow: /opt/velib-venv /opt/airflow/dbt_state /home/airflow/.cache

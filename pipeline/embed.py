@@ -47,8 +47,13 @@ def run_embed() -> dict:
 
         for doc, vector in zip(documents, vectors):
             doc["embedding"] = vector
-        indexed = index_documents(_get_qdrant_client(), documents, version)
-        logger.info(f"Qdrant réindexé : {indexed} points")
+        # Qdrant est optionnel : les vecteurs sont déjà dans le gold, une panne ne bloque pas le job
+        try:
+            indexed = index_documents(_get_qdrant_client(), documents, version)
+            logger.info(f"Qdrant réindexé : {indexed} points")
+        except Exception as e:
+            indexed = f"échec : {type(e).__name__}"
+            logger.warning(f"Qdrant injoignable, index non mis à jour ({e}). L'application réindexera depuis le gold.")
     else:
         logger.info("QDRANT_URL / QDRANT_API_KEY absents : Qdrant non mis à jour.")
 

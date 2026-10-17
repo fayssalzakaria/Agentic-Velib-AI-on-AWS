@@ -165,6 +165,12 @@ def semantic_search_tool(
     }
 
 
+def forecast_tool(station_name: str | None) -> dict:
+    """Risque de vide dans 1 h (modèle LightGBM publié dans le lakehouse)."""
+    from src.ml.forecast import forecast_for_station
+    return forecast_for_station(station_name or "")
+
+
 def generate_report_tool(df: pd.DataFrame) -> dict:
     """
     Génère un rapport PDF en mémoire.

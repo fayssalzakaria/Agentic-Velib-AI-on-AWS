@@ -6,13 +6,12 @@ pytz
 numpy
 duckdb==1.5.6
 rank-bm25
+lightgbm==4.7.0
 sentence-transformers
 qdrant-client
 reportlab
 fastapi
 uvicorn
-langchain
 langchain-core
-langchain-community
 langchain-groq
 pydantic

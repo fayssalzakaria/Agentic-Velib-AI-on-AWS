@@ -2,7 +2,7 @@
 velib_lakehouse.py — DAGs Airflow 3 du lakehouse Vélib' (collecteur principal).
 
 - velib_ingest_hourly : API Vélib' -> bronze -> silver, toutes les heures à :05
-- velib_daily_gold    : OPTIMIZE + VACUUM silver, modèles gold dbt (Cosmos), embeddings, à 02:15
+- velib_daily_gold    : OPTIMIZE + VACUUM silver, gold dbt (Cosmos), embeddings et modèle de prévision, à 02:15
 
 Le code métier est celui de pipeline/ (le même que GitHub Actions, collecteur de secours).
 Il tourne dans /opt/velib-venv via @task.external_python pour isoler ses dépendances
@@ -96,6 +96,14 @@ def velib_daily_gold():
         return run_embed()
 
     @task.external_python(python=VENV_PYTHON, expect_airflow=False)
+    def train_forecast() -> dict:
+        import sys
+        sys.path.insert(0, "/opt/project")
+        from pipeline.forecast import train_forecast as train
+        # Publié seulement s'il bat les baselines ; ignoré tant que l'historique est trop court
+        return train()
+
+    @task.external_python(python=VENV_PYTHON, expect_airflow=False)
     def mark_daily_done() -> str:
         import sys
         sys.path.insert(0, "/opt/project")
@@ -103,7 +111,7 @@ def velib_daily_gold():
         # Signale à GitHub Actions (secours) que le job du jour est fait
         return mark_done("daily")
 
-    optimize_vacuum_silver() >> gold >> embed_profiles() >> mark_daily_done()
+    optimize_vacuum_silver() >> gold >> [embed_profiles(), train_forecast()] >> mark_daily_done()
 
 
 velib_ingest_hourly()

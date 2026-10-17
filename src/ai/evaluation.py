@@ -36,6 +36,8 @@ EVAL_SET = [
              frozenset({"search_history"}), "BASTILLE"),
     EvalCase("Pigalle a-t-elle des vélos le soir en général ?",
              frozenset({"search_history"}), "PIGALLE"),
+    EvalCase("Est-ce que la station Nation risque d'être vide dans une heure ?",
+             frozenset({"forecast_station"}), "NATION"),
     # Question composée : il faut l'état actuel ET l'historique
     EvalCase("La station Nation est vide là, c'est habituel à cette heure-ci ?",
              frozenset({"get_station_info", "search_history"}), "NATION"),

@@ -19,6 +19,7 @@ from src.ai.prompts import FINAL_SYNTHESIS_PROMPT
 from src.ai.router import classify_question
 from src.ai.tools import (
     detect_anomalies_tool,
+    forecast_tool,
     generate_report_tool,
     get_network_stats_tool,
     get_station_info_tool,
@@ -231,6 +232,11 @@ def _run_assistant(
 
             trace.tools_used.append("semantic_search")
             tool_outputs["semantic_search"] = semantic_result
+
+        elif intent == "forecast":
+            station = _extract_possible_station(question, df)
+            trace.tools_used.append("forecast_station")
+            tool_outputs["forecast_station"] = forecast_tool(station)
 
         elif intent == "report":
             stats = get_network_stats_tool(df)
