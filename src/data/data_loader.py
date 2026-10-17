@@ -1,6 +1,8 @@
 """
 data_loader.py — Snapshot temps réel depuis l'API Open Data Vélib'.
 """
+import time
+
 import pandas as pd
 import requests
 
@@ -11,16 +13,27 @@ API_V21_EXPORT = (
 )
 
 
+def _get_with_retries(url: str, attempts: int = 3) -> list[dict]:
+    """Coupures réseau ponctuelles (connexion réinitialisée, 5xx) : on réessaie avant d'abandonner."""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except (requests.ConnectionError, requests.Timeout, requests.HTTPError):
+            if attempt == attempts:
+                raise
+            time.sleep(1.5 * attempt)
+    return []
+
+
 def fetch_api_snapshot() -> pd.DataFrame:
     """
     Snapshot instantané de toutes les stations (API v2.1, un seul appel), sans cache :
     c'est le mode Temps réel, rafraîchi à la demande de l'utilisateur.
     """
-    response = requests.get(API_V21_EXPORT, timeout=30)
-    response.raise_for_status()
-
     rows = []
-    for rec in response.json():
+    for rec in _get_with_retries(API_V21_EXPORT):
         bikes = int(rec.get("numbikesavailable") or 0)
         docks = int(rec.get("numdocksavailable") or 0)
         geo = rec.get("coordonnees_geo") or {}

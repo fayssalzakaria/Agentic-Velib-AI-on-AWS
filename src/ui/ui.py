@@ -52,16 +52,40 @@ def render_sidebar():
 
 
 def get_session_snapshot(refresh: bool = False) -> pd.DataFrame | None:
-    """Snapshot propre à la session : pris à l'arrivée sur la page, puis à chaque rafraîchissement."""
-    if refresh or "snapshot_df" not in st.session_state:
-        try:
-            with st.spinner("Snapshot de l'API Vélib' en cours..."):
-                st.session_state.snapshot_df = fetch_api_snapshot()
-            st.session_state.snapshot_at = datetime.now(pytz.timezone(PARIS_TIMEZONE))
-        except Exception as e:
-            st.error(f"API Vélib' indisponible : {e}")
-            return None
-    return st.session_state.snapshot_df
+    """
+    Snapshot propre à la session : pris à l'arrivée sur la page, puis à chaque rafraîchissement.
+    Si l'API est injoignable : on garde le snapshot précédent, sinon le dernier du lakehouse.
+    """
+    if not refresh and "snapshot_df" in st.session_state:
+        return st.session_state.snapshot_df
+
+    try:
+        with st.spinner("Snapshot de l'API Vélib' en cours..."):
+            df = fetch_api_snapshot()
+        st.session_state.snapshot_df = df
+        st.session_state.snapshot_at = datetime.now(pytz.timezone(PARIS_TIMEZONE))
+        st.session_state.snapshot_source = "API Open Data Vélib'"
+        return df
+    except Exception as e:
+        error = e
+
+    if "snapshot_df" in st.session_state:
+        st.warning(f"API Vélib' momentanément injoignable ({type(error).__name__}) : snapshot précédent conservé.")
+        return st.session_state.snapshot_df
+
+    fallback = lake.latest_snapshot()
+    if not fallback.empty:
+        st.warning(
+            f"API Vélib' injoignable ({type(error).__name__}) : affichage du dernier snapshot collecté "
+            f"par le pipeline. Réessayez avec le bouton « Récupérer »."
+        )
+        st.session_state.snapshot_df = fallback
+        st.session_state.snapshot_at = fallback["ingested_at"].iloc[0].to_pydatetime()
+        st.session_state.snapshot_source = f"lakehouse, collecté par {fallback['ingested_by'].iloc[0]}"
+        return fallback
+
+    st.error(f"API Vélib' indisponible et aucun snapshot dans le lakehouse : {error}")
+    return None
 
 
 SNAPSHOT_BUTTON_PREFIX = "snapshot_refresh_"
@@ -101,7 +125,7 @@ def render_snapshot_bar(key: str, label: str = "Données temps réel") -> pd.Dat
     if df is not None:
         col_info.info(
             f"**{label}** : snapshot du {st.session_state.snapshot_at:%d/%m/%Y à %H:%M:%S} "
-            f"({_snapshot_age()}) — {len(df)} stations, API Open Data Vélib'"
+            f"({_snapshot_age()}) — {len(df)} stations, source : {st.session_state.snapshot_source}"
         )
     return df
 

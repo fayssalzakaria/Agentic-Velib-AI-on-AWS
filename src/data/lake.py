@@ -129,6 +129,21 @@ def available_stations(hours: int = 24) -> list[str]:
     return df["name"].tolist() if not df.empty else []
 
 
+def latest_snapshot() -> pd.DataFrame:
+    """Dernier snapshot du silver : secours quand l'API temps réel est injoignable."""
+    df = query(f"""
+        WITH s AS (SELECT * FROM {_silver()} WHERE date >= ?)
+        SELECT station_id, name, numbikesavailable, mechanical, ebike, numdocksavailable,
+               is_empty, is_full, coalesce(bike_ratio, 0) AS bike_ratio, lat, lon,
+               ingested_at, ingested_by
+        FROM s
+        WHERE snapshot_id = (SELECT max(snapshot_id) FROM s)
+    """, [(datetime.now(timezone.utc) - timedelta(days=2)).astimezone(PARIS_TZ).strftime("%Y-%m-%d")])
+    if not df.empty:
+        df["ingested_at"] = pd.to_datetime(df["ingested_at"], utc=True).dt.tz_convert(PARIS_TZ)
+    return df
+
+
 def station_period_profiles() -> pd.DataFrame:
     """Profils gold par station / type de jour / période (construits par dbt chaque nuit)."""
     return query(f"SELECT * FROM {_gold('gold_station_period_profile')}")
