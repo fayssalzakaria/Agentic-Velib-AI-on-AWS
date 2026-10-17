@@ -85,65 +85,50 @@ KEYWORDS_REPORT = [
 ]
 
 
+def _matched(q: str, keywords: list[str]) -> list[str]:
+    return [kw for kw in keywords if kw in q]
+
+
+def _route(intent: str, rule: str, matched: list[str], reason: str) -> dict:
+    """
+    Résultat du routage par règles. Pas de « confiance » chiffrée : une règle s'applique ou non.
+    On renvoie donc la règle et les mots qui l'ont déclenchée, ce qui est vérifiable.
+    """
+    return {"intent": intent, "rule": rule, "matched": matched, "confidence": None, "reason": reason}
+
+
 def classify_question_rule_based(question: str) -> dict:
     """
-    Classification simple sans LLM.
-    Sert de fallback rapide et économique.
+    Classification sans LLM, par règles testées dans l'ordre (la première qui s'applique gagne).
+    Rapide, gratuite et déterministe.
     """
     q = question.lower()
     keywords = extract_keywords(question)
     time_expressions = detect_time_expression(question)
+    now = _matched(q, KEYWORDS_NOW)
 
-    if any(kw in q for kw in KEYWORDS_REPORT):
-        return {
-            "intent": "report",
-            "confidence": 0.75,
-            "reason": "La question demande un rapport ou une synthèse.",
-        }
+    if found := _matched(q, KEYWORDS_REPORT):
+        return _route("report", "rapport", found, "La question demande un rapport ou une synthèse.")
 
-    is_now = any(kw in q for kw in KEYWORDS_NOW)
+    if not now and (found := _matched(q, KEYWORDS_HABIT)):
+        return _route("historical", "habitude", found, "La question porte sur une habitude ou une tendance.")
 
-    if not is_now and any(kw in q for kw in KEYWORDS_HABIT):
-        return {
-            "intent": "historical",
-            "confidence": 0.85,
-            "reason": (
-                "La question porte sur une habitude ou une tendance. "
-                f"Mots-clés NLP : {', '.join(keywords[:5])}. "
-                f"Temps détecté : {', '.join(time_expressions) if time_expressions else 'aucun'}."
-            ),
-        }
+    if found := _matched(q, KEYWORDS_ANOMALY):
+        return _route("anomaly", "anomalie", found, "La question mentionne des anomalies ou des stations critiques.")
 
-    if any(kw in q for kw in KEYWORDS_ANOMALY):
-        return {
-            "intent": "anomaly",
-            "confidence": 0.8,
-            "reason": "La question mentionne des anomalies ou stations critiques.",
-        }
+    if not now and (found := _matched(q, KEYWORDS_HISTORICAL)):
+        return _route(
+            "historical", "période de temps", found,
+            f"La question vise une période ({', '.join(time_expressions) or ', '.join(found)}).",
+        )
 
-    if not is_now and any(kw in q for kw in KEYWORDS_HISTORICAL):
-        return {
-            "intent": "historical",
-            "confidence": 0.8,
-            "reason": (
-                "La question concerne une tendance ou un historique. "
-                f"Mots-clés NLP : {', '.join(keywords[:5])}. "
-                f"Temps détecté : {', '.join(time_expressions) if time_expressions else 'aucun'}."
-            ),
-        }
+    if found := _matched(q, KEYWORDS_REALTIME) or now:
+        return _route("realtime", "temps réel", found, "La question porte sur l'état actuel du réseau.")
 
-    if any(kw in q for kw in KEYWORDS_REALTIME):
-        return {
-            "intent": "realtime",
-            "confidence": 0.65,
-            "reason": "La question semble porter sur l'état actuel du réseau.",
-        }
-
-    return {
-        "intent": "general",
-        "confidence": 0.5,
-        "reason": f"Aucune intention spécifique détectée. Mots-clés NLP : {', '.join(keywords[:5])}",
-    }
+    return _route(
+        "general", "aucune", [],
+        f"Aucune règle ne reconnaît la question (mots-clés : {', '.join(keywords[:5]) or 'aucun'}).",
+    )
 
 
 def classify_question(question: str, use_llm: bool = False) -> dict:
@@ -173,7 +158,7 @@ Question utilisateur :
         )
 
         intent = data.get("intent", rule_result["intent"])
-        confidence = float(data.get("confidence", rule_result["confidence"]))
+        confidence = float(data.get("confidence") or 0.0)
         reason = data.get("reason", rule_result["reason"])
 
         valid_intents = {
@@ -190,6 +175,8 @@ Question utilisateur :
 
         return {
             "intent": intent,
+            "rule": "routeur LLM",
+            "matched": [],
             "confidence": max(0.0, min(1.0, confidence)),
             "reason": reason,
         }

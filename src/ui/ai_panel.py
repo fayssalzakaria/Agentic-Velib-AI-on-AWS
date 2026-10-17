@@ -86,8 +86,12 @@ def _assistant_details(trace) -> None:
     with st.expander("Comment j'ai répondu"):
         c1, c2, c3 = st.columns(3)
         c1.metric("Intention", trace.intent)
-        c2.metric("Confiance", f"{trace.confidence:.0%}")
+        c2.metric("Règle appliquée", trace.rule or "—")
         c3.metric("Outils", len(trace.tools_used))
+        st.caption(
+            "Mots qui ont déclenché la règle : "
+            + (", ".join(f"« {kw} »" for kw in trace.matched_keywords) or "aucun")
+        )
         st.caption(f"Routage : {trace.routing_reason}")
         if trace.delegated_to_agent:
             st.info("Question non reconnue par les règles : l'agent a choisi ses outils lui-même.")

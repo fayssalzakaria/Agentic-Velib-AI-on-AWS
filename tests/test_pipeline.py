@@ -192,3 +192,14 @@ def test_track_usage_sums_calls_tokens_and_cost(monkeypatch):
     # hors d'un bloc track_usage, rien n'est compté
     llm.call_llm([{"role": "user", "content": "c"}], model="openai/gpt-oss-120b")
     assert usage.calls == 2
+
+
+def test_router_reports_rule_and_matched_keywords():
+    from src.ai.router import classify_question_rule_based
+
+    route = classify_question_rule_based("Bastille est-elle souvent vide le matin ?")
+    assert route["rule"] == "habitude" and route["matched"] == ["souvent"]
+    assert route["confidence"] is None  # pas de faux pourcentage pour une règle
+
+    route = classify_question_rule_based("salut")
+    assert route["intent"] == "general" and route["rule"] == "aucune" and route["matched"] == []

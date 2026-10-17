@@ -42,7 +42,9 @@ class NLPRequest(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     intent: str
-    confidence: float
+    rule: str = ""
+    matched_keywords: list[str] = []
+    confidence: Optional[float] = None
     routing_reason: str
     tools_used: list[str]
     relevance_score: Optional[int] = None
@@ -93,6 +95,8 @@ def ask_assistant(payload: AskRequest) -> AskResponse:
     return AskResponse(
         answer=answer,
         intent=trace.intent,
+        rule=trace.rule,
+        matched_keywords=trace.matched_keywords,
         confidence=trace.confidence,
         routing_reason=trace.routing_reason,
         tools_used=trace.tools_used,

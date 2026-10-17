@@ -32,7 +32,9 @@ from src.ai.tools import (
 class AssistantTrace:
     question: str
     intent: str = ""
-    confidence: float = 0.0
+    confidence: float | None = None
+    rule: str = ""
+    matched_keywords: list[str] = field(default_factory=list)
     routing_reason: str = ""
     tools_used: list[str] = field(default_factory=list)
     tool_results: dict[str, Any] = field(default_factory=dict)
@@ -153,7 +155,9 @@ def _run_assistant(
     intent = routing.get("intent", "general")
 
     trace.intent = intent
-    trace.confidence = routing.get("confidence", 0.0)
+    trace.confidence = routing.get("confidence")
+    trace.rule = routing.get("rule", "")
+    trace.matched_keywords = routing.get("matched", [])
     trace.routing_reason = routing.get("reason", "")
 
     tool_outputs = {}
