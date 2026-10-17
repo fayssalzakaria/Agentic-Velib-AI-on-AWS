@@ -125,3 +125,47 @@ def test_search_stations_ignores_accents_order_and_punctuation():
     assert search_stations(df, "republique")["name"].tolist() == ["PLACE DE LA RÉPUBLIQUE - VOLTAIRE"]
     assert search_stations(df, "athenes")["name"].tolist() == ["ATHÈNES - CLICHY"]
     assert search_stations(df, "  ").empty
+
+
+class _FakeResponse:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+        self.ok, self.reason, self.text = status < 400, "error", str(body)
+
+    def json(self):
+        return self._body
+
+
+def _fake_groq(monkeypatch, status=200, body=None):
+    import llm_client
+    sent = {}
+
+    def fake_post(url, headers, json, timeout):
+        sent.clear()
+        sent.update(json)
+        return _FakeResponse(status, body)
+
+    monkeypatch.setattr(llm_client, "GROQ_API_KEY", "test")
+    monkeypatch.setattr(llm_client.requests, "post", fake_post)
+    return llm_client, sent
+
+
+def test_reasoning_model_gets_low_effort_and_token_floor(monkeypatch):
+    body = {"choices": [{"message": {"content": "<think>hmm</think> Bonjour", "reasoning": "..."}}], "usage": {}}
+    llm, sent = _fake_groq(monkeypatch, body=body)
+
+    data = llm.call_llm([{"role": "user", "content": "salut"}], model="openai/gpt-oss-120b", max_tokens=150)
+    assert sent["reasoning_effort"] == "low"
+    assert sent["max_tokens"] == 1024
+    message = data["choices"][0]["message"]
+    assert message["content"] == "Bonjour" and "reasoning" not in message
+
+    llm.call_llm([{"role": "user", "content": "salut"}], model="llama-autre", max_tokens=150)
+    assert "reasoning_effort" not in sent and sent["max_tokens"] == 150
+
+
+def test_groq_error_message_is_explicit(monkeypatch):
+    body = {"error": {"message": "The model `llama-3.3-70b-versatile` does not exist"}}
+    llm, _ = _fake_groq(monkeypatch, status=404, body=body)
+    with pytest.raises(RuntimeError, match="Groq 404 : The model"):
+        llm.call_llm([{"role": "user", "content": "salut"}])

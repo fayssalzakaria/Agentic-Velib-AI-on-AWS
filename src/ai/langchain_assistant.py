@@ -19,7 +19,7 @@ def get_langchain_llm():
         raise RuntimeError("GROQ_API_KEY non configurée.")
 
     return ChatGroq(
-        model=os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
         temperature=0.2,
         api_key=api_key,
     )
@@ -62,5 +62,5 @@ Réponse :
     return {
         "answer": response.content,
         "framework": "LangChain",
-        "model": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "model": os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
     }

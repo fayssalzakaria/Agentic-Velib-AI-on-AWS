@@ -8,6 +8,7 @@ Objectif :
 
 import json
 import os
+import re
 from typing import Any
 
 import requests
@@ -19,7 +20,33 @@ GROQ_URL = os.environ.get(
     "https://api.groq.com/openai/v1/chat/completions",
 )
 
-DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+
+# Les modèles qui raisonnent consomment des tokens de réflexion dans la même limite
+# que la réponse : on réduit la réflexion et on garantit un minimum de tokens.
+REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
+MIN_TOKENS_REASONING_MODEL = 1024
+_THINK_TAGS = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def _is_reasoning_model(model: str) -> bool:
+    return "gpt-oss" in model.lower()
+
+
+def _clean_content(content: str | None) -> str:
+    """Retire une éventuelle réflexion laissée dans le texte (<think>…</think>)."""
+    return _THINK_TAGS.sub("", content or "").strip()
+
+
+def _raise_for_groq_error(response: requests.Response) -> None:
+    """Remonte le message d'erreur de Groq (modèle inconnu, clé invalide, quota…)."""
+    if response.ok:
+        return
+    try:
+        detail = response.json().get("error", {}).get("message", "")
+    except ValueError:
+        detail = response.text[:300]
+    raise RuntimeError(f"Groq {response.status_code} : {detail or response.reason}")
 
 
 def is_llm_configured() -> bool:
@@ -64,6 +91,10 @@ def call_llm(
         payload["tools"] = tools
         payload["tool_choice"] = tool_choice or "auto"
 
+    if _is_reasoning_model(model):
+        payload["reasoning_effort"] = REASONING_EFFORT
+        payload["max_tokens"] = max(max_tokens, MIN_TOKENS_REASONING_MODEL)
+
     response = requests.post(
         GROQ_URL,
         headers={
@@ -74,8 +105,16 @@ def call_llm(
         timeout=timeout,
     )
 
-    response.raise_for_status()
-    return response.json()
+    _raise_for_groq_error(response)
+    data = response.json()
+
+    # Réponse normalisée : texte sans réflexion, et pas de champ « reasoning »
+    # (l'agent renvoie ce message à Groq lors du second appel)
+    for choice in data.get("choices", []):
+        message = choice.get("message", {})
+        message.pop("reasoning", None)
+        message["content"] = _clean_content(message.get("content"))
+    return data
 
 
 def call_llm_text(
