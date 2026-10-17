@@ -61,7 +61,13 @@ def _compute_predictions() -> tuple[pd.DataFrame | None, dict]:
         [int(ts_next.tz_convert(PARIS_TZ).hour)],
     )
 
-    frame = serving_frame(current, lag1, lag2, hour_stats)
+    weather = lake.query(
+        f"SELECT * FROM delta_scan('{lake.lake_root()}/silver/weather') WHERE ts = ?",
+        [ts_next.to_pydatetime()],
+    )
+    school = lake.query(f"SELECT * FROM read_parquet('{lake.lake_root()}/silver/school_holidays.parquet')")
+    frame = serving_frame(current, lag1, lag2, hour_stats,
+                          weather if not weather.empty else None, school if not school.empty else None)
     frame["risk"] = _load_booster(published["version"]).predict(frame[FEATURES])
     info = {
         "snapshot_at": ts.tz_convert(PARIS_TZ),

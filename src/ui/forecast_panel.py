@@ -48,6 +48,49 @@ def _model_card(model: dict) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def _monitoring(table: str) -> pd.DataFrame:
+    return lake.query(f"SELECT * FROM read_parquet('{lake.lake_root()}/gold/{table}.parquet')")
+
+
+def _production_performance(model: dict) -> None:
+    """Le modèle face à la réalité : prévisions enregistrées chaque heure, évaluées chaque nuit."""
+    daily = _monitoring("model_monitoring_daily")
+    if daily.empty:
+        st.info("Pas encore de suivi en production : les prévisions sont enregistrées à chaque collecte "
+                "et comparées à la réalité chaque nuit.")
+        return
+
+    offline_auc = model["evaluation"]["model"]["auc"]
+    fig = px.line(daily, x="date", y="auc", markers=True, labels={"date": "Jour", "auc": "AUC en production"})
+    fig.add_hline(y=offline_auc, line_dash="dash", annotation_text=f"AUC au test : {offline_auc}")
+    fig.update_layout(title="Qualité jour par jour (prévisions vs réalité)", height=280, margin=dict(t=40, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    col_calib, col_drift = st.columns(2)
+    calibration = _monitoring("model_calibration")
+    if not calibration.empty:
+        fig = px.scatter(calibration, x="mean_predicted", y="observed_rate", size="predictions",
+                         labels={"mean_predicted": "Risque annoncé", "observed_rate": "Fréquence réelle de vide"})
+        fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(dash="dash", color="grey"))
+        fig.update_layout(title="Calibration (7 derniers jours)", height=320, margin=dict(t=40, b=10))
+        fig.update_xaxes(range=[0, 1], tickformat=".0%")
+        fig.update_yaxes(range=[0, 1], tickformat=".0%")
+        col_calib.plotly_chart(fig, use_container_width=True)
+        col_calib.caption("Sur la diagonale : quand le modèle annonce 30 %, la station est vide 30 % du temps.")
+
+    drift = _monitoring("model_drift")
+    if not drift.empty:
+        col_drift.markdown("**Dérive des données (PSI, dernières 24 h vs entraînement)**")
+        icons = {"stable": "🟢", "à surveiller": "🟠", "dérive": "🔴"}
+        col_drift.dataframe(
+            drift.assign(État=drift["status"].map(lambda v: f"{icons.get(v, '')} {v}"))[["feature", "psi", "État"]]
+            .rename(columns={"feature": "Variable", "psi": "PSI"}),
+            hide_index=True, use_container_width=True,
+        )
+        col_drift.caption("PSI < 0,1 : stable · 0,1 à 0,25 : à surveiller · > 0,25 : dérive, réentraînement conseillé.")
+
+
 def render_forecast() -> None:
     st.subheader("🔮 Prévision : stations vides dans 1 heure")
     if not lake.is_configured():
@@ -110,4 +153,6 @@ def render_forecast() -> None:
 
     with st.expander("Fiche du modèle : performances face aux baselines"):
         _model_card(info["model"])
+    with st.expander("📈 Performance en production (monitoring)"):
+        _production_performance(info["model"])
     st.divider()

@@ -96,6 +96,22 @@ def velib_daily_gold():
         return run_embed()
 
     @task.external_python(python=VENV_PYTHON, expect_airflow=False)
+    def fetch_external() -> dict:
+        import sys
+        sys.path.insert(0, "/opt/project")
+        from pipeline.external import run_external
+        # Météo (Open-Meteo) et vacances scolaires : features du modèle de prévision
+        return run_external()
+
+    @task.external_python(python=VENV_PYTHON, expect_airflow=False)
+    def monitor_model() -> dict:
+        import sys
+        sys.path.insert(0, "/opt/project")
+        from pipeline.monitoring import evaluate_production
+        # Prévisions des dernières 24 h comparées à la réalité, calibration, dérive des features
+        return evaluate_production()
+
+    @task.external_python(python=VENV_PYTHON, expect_airflow=False)
     def train_forecast() -> dict:
         import sys
         sys.path.insert(0, "/opt/project")
@@ -111,7 +127,12 @@ def velib_daily_gold():
         # Signale à GitHub Actions (secours) que le job du jour est fait
         return mark_done("daily")
 
-    optimize_vacuum_silver() >> gold >> [embed_profiles(), train_forecast()] >> mark_daily_done()
+    external, train, monitor = fetch_external(), train_forecast(), monitor_model()
+    embed, done = embed_profiles(), mark_daily_done()
+
+    optimize_vacuum_silver() >> gold >> [embed, external]
+    external >> train >> monitor
+    [embed, monitor] >> done
 
 
 velib_ingest_hourly()

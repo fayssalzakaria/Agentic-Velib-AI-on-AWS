@@ -91,3 +91,75 @@ def test_end_to_end_train_publish_and_predict(tmp_path, monkeypatch):
 
     answer = forecast.forecast_for_station("STATION 001")
     assert answer["stations"][0]["station"] == "STATION 001"
+
+
+def test_external_features_weather_and_calendar():
+    """Météo de l'heure prédite, jour férié (11 novembre) et vacances scolaires."""
+    from src.ml.features import _external
+
+    ts_next = pd.Series(pd.to_datetime(["2026-11-11 10:00", "2026-10-20 10:00", "2026-09-15 10:00"], utc=True))
+    weather = pd.DataFrame({"ts": ts_next, "temperature": [8.0, 12.5, 20.0],
+                            "precipitation": [0.0, 1.2, 0.0], "wind_speed": [10.0, 5.0, 3.0]})
+    school = pd.DataFrame({"start": [pd.Timestamp("2026-10-17", tz="UTC")],
+                           "end": [pd.Timestamp("2026-11-02", tz="UTC")]})
+
+    out = _external(ts_next, weather, school)
+    assert out["temperature"].tolist() == [8.0, 12.5, 20.0]
+    assert out["is_public_holiday"].tolist() == [1.0, 0.0, 0.0]
+    assert out["is_school_holiday"].tolist() == [0.0, 1.0, 0.0]
+
+    without = _external(ts_next, None, None)
+    assert without["temperature"].isna().all() and without["is_school_holiday"].isna().all()
+
+
+def test_production_monitoring_end_to_end(tmp_path, monkeypatch):
+    """12 heures de « production » simulées : prévision enregistrée à chaque collecte, puis évaluation."""
+    from deltalake import write_deltalake
+
+    monkeypatch.setenv("LAKE_ROOT", str(tmp_path).replace("\\", "/"))
+    silver = synthetic_silver(n_stations=30, days=16, seed=4)
+    ts = pd.to_datetime(silver["ingested_at"], utc=True)
+    delta = silver.assign(
+        ingested_at=ts, hour=ts.dt.tz_convert(PARIS_TZ).dt.hour.astype("int32"),
+        snapshot_id=ts.dt.strftime("%Y%m%dT%H00Z"), is_full=silver["numdocksavailable"] == 0, ingested_by="test",
+    )
+    instants = sorted(ts.unique())
+    # reset_index : sinon pandas transmet l'index filtré comme une colonne de plus
+    history = delta[ts < instants[-12]].reset_index(drop=True)
+    live = [delta[ts == t].reset_index(drop=True) for t in instants[-12:]]
+    silver_uri = str(tmp_path / "silver" / "station_status")
+    write_deltalake(silver_uri, history, partition_by=["date"])
+
+    from pipeline.forecast import train_forecast
+    assert train_forecast(silver[ts < instants[-12]])["promoted"]
+
+    import src.data.lake as lake
+    from pipeline.monitoring import evaluate_production, log_predictions
+    logged = 0
+    for snapshot in live:
+        write_deltalake(silver_uri, snapshot, partition_by=["date"], mode="append")
+        monkeypatch.setattr(lake, "_connection", None)
+        logged += log_predictions()
+    assert logged == 12 * 30
+
+    result = evaluate_production(silver)
+    assert result["status"] == "evaluated" and result["scored_predictions"] == 11 * 30  # la dernière heure n'est pas encore passée
+
+    import pyarrow.parquet as pq
+    daily = pq.read_table(str(tmp_path / "gold" / "model_monitoring_daily.parquet")).to_pandas()
+    calibration = pq.read_table(str(tmp_path / "gold" / "model_calibration.parquet")).to_pandas()
+    drift = pq.read_table(str(tmp_path / "gold" / "model_drift.parquet")).to_pandas()
+    assert daily["predictions"].sum() == 11 * 30
+    assert calibration["predictions"].sum() == 11 * 30
+    assert set(drift["status"]) <= {"stable", "à surveiller", "dérive"} and len(drift) >= 8
+    assert not {"weekday_next", "past_n"} & set(drift["feature"])  # exclues par construction
+
+
+def test_psi_detects_a_shift():
+    from pipeline.forecast import reference_distribution
+    from pipeline.monitoring import psi
+
+    rng = np.random.default_rng(0)
+    reference = reference_distribution(pd.DataFrame({"x": rng.normal(0, 1, 5000)}), ["x"])["x"]
+    assert psi(reference, rng.normal(0, 1, 2000)) < 0.1      # même distribution : stable
+    assert psi(reference, rng.normal(1.5, 1, 2000)) > 0.25   # moyenne décalée : dérive

@@ -6,8 +6,11 @@ Une seule définition, utilisée à l'entraînement (pipeline/forecast.py) ET à
 lui donne en production (training-serving skew).
 
 Aucune feature ne regarde le futur : le taux de vide habituel d'une station n'utilise que les
-observations antérieures à l'heure prédite.
+observations antérieures à l'heure prédite. La météo de l'heure prédite est une prévision
+(Open-Meteo) au moment de la prédiction, et une valeur observée à l'entraînement.
 """
+from functools import lru_cache
+
 import numpy as np
 import pandas as pd
 
@@ -19,7 +22,11 @@ FEATURES = [
     "delta_1h", "delta_2h",
     "hour_next", "weekday_next", "is_weekend_next",
     "past_rate_empty", "past_n",
+    # Données externes (manquantes = NaN, géré nativement par LightGBM)
+    "temperature", "precipitation", "wind_speed",
+    "is_public_holiday", "is_school_holiday",
 ]
+WEATHER_COLUMNS = ["temperature", "precipitation", "wind_speed"]
 LABEL = "empty_next"
 
 SILVER_COLUMNS = [
@@ -62,16 +69,52 @@ def _calendar(ts_next: pd.Series) -> pd.DataFrame:
     }, index=ts_next.index)
 
 
-def _assemble(frame: pd.DataFrame) -> pd.DataFrame:
-    """Dernière étape commune : variations, calendrier de l'heure prédite, ordre des colonnes."""
+@lru_cache(maxsize=8)
+def _public_holidays(year: int) -> frozenset:
+    import holidays
+    return frozenset(holidays.France(years=year))
+
+
+def _external(ts_next: pd.Series, weather: pd.DataFrame | None, school: pd.DataFrame | None) -> pd.DataFrame:
+    """Météo et calendrier (jours fériés, vacances scolaires) de l'heure prédite."""
+    out = pd.DataFrame({"ts_next": ts_next}, index=ts_next.index)
+    if weather is not None and not weather.empty:
+        w = weather.assign(ts_next=pd.to_datetime(weather["ts"], utc=True))[["ts_next", *WEATHER_COLUMNS]]
+        out = (out.rename_axis("row").reset_index()
+               .merge(w.drop_duplicates("ts_next"), on="ts_next", how="left").set_index("row"))
+    for column in WEATHER_COLUMNS:
+        if column not in out:
+            out[column] = np.nan
+
+    # Calcul par heure distincte (quelques milliers) puis propagation aux lignes (millions)
+    hours = pd.Series(ts_next.unique())
+    local_dates = hours.dt.tz_convert(PARIS_TZ).dt.date
+    index = pd.DatetimeIndex(hours)  # garde le fuseau UTC pour que la correspondance fonctionne
+    public = pd.Series([float(d in _public_holidays(d.year)) for d in local_dates], index=index)
+    out["is_public_holiday"] = ts_next.map(public).to_numpy()
+    if school is not None and not school.empty:
+        starts, ends = school["start"].to_numpy(), school["end"].to_numpy()
+        vacation = pd.Series([float(((starts <= v) & (v < ends)).any()) for v in hours.to_numpy()],
+                             index=index)
+        out["is_school_holiday"] = ts_next.map(vacation).to_numpy()
+    else:
+        out["is_school_holiday"] = np.nan
+    return out[[*WEATHER_COLUMNS, "is_public_holiday", "is_school_holiday"]]
+
+
+def _assemble(frame: pd.DataFrame, weather: pd.DataFrame | None = None,
+              school: pd.DataFrame | None = None) -> pd.DataFrame:
+    """Dernière étape commune : variations, calendrier et données externes de l'heure prédite."""
     frame["delta_1h"] = frame["bikes"] - frame["bikes_lag1"]
     frame["delta_2h"] = frame["bikes"] - frame["bikes_lag2"]
-    frame = frame.join(_calendar(frame["ts"] + HORIZON))
+    ts_next = frame["ts"] + HORIZON
+    frame = frame.join(_calendar(ts_next)).join(_external(ts_next, weather, school))
     frame["past_rate_empty"] = frame["past_empty"] / frame["past_n"].replace(0, np.nan)
     return frame
 
 
-def training_frame(silver: pd.DataFrame) -> pd.DataFrame:
+def training_frame(silver: pd.DataFrame, weather: pd.DataFrame | None = None,
+                   school: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Une ligne par (station, heure t) avec les features à t et la cible : vide à t + 1 h ?
     Les lignes sans observation à t + 1 h (trou de collecte, dernière heure) ont une cible vide.
@@ -95,11 +138,12 @@ def training_frame(silver: pd.DataFrame) -> pd.DataFrame:
         .merge(_lag(state, 2), on=["station_id", "ts"], how="left")
         .merge(nxt, on=["station_id", "ts"], how="left")
     )
-    return _assemble(frame)
+    return _assemble(frame, weather, school)
 
 
 def serving_frame(current: pd.DataFrame, lag1: pd.DataFrame, lag2: pd.DataFrame,
-                  hour_stats: pd.DataFrame) -> pd.DataFrame:
+                  hour_stats: pd.DataFrame, weather: pd.DataFrame | None = None,
+                  school: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Mêmes features pour le dernier snapshot connu, afin de prédire l'heure suivante.
     hour_stats : par station, nombre d'observations (past_n) et de fois vide (past_empty)
@@ -111,7 +155,7 @@ def serving_frame(current: pd.DataFrame, lag1: pd.DataFrame, lag2: pd.DataFrame,
     stats = hour_stats.assign(station_id=hour_stats["station_id"].astype(str))[["station_id", "past_n", "past_empty"]]
     frame = frame.merge(stats, on="station_id", how="left")
     frame[["past_n", "past_empty"]] = frame[["past_n", "past_empty"]].fillna(0)
-    return _assemble(frame)
+    return _assemble(frame, weather, school)
 
 
 def _empty_lag(hours: int) -> pd.DataFrame:

@@ -6,6 +6,8 @@ run.py — Point d'entrée du pipeline (exécuté par GitHub Actions).
     python -m pipeline.run backfill   # importe les anciens CSV S3 dans silver
     python -m pipeline.run embed      # embeddings des profils gold (+ Qdrant)
     python -m pipeline.run forecast   # entraîne le modèle « vide dans 1 h » (LightGBM)
+    python -m pipeline.run external   # météo et vacances scolaires (features du modèle)
+    python -m pipeline.run monitor    # compare les prévisions passées à la réalité (monitoring)
 """
 import argparse
 import json
@@ -42,19 +44,28 @@ def ingest() -> dict:
     silver = to_silver(records, ts)
     inserted = merge_silver(silver)
 
+    # Monitoring : on garde la prévision de l'heure suivante pour la comparer à la réalité
+    try:
+        from pipeline.monitoring import log_predictions
+        predictions_logged = log_predictions()
+    except Exception as e:  # le suivi du modèle ne doit jamais bloquer la collecte
+        logger.warning(f"Prévisions non enregistrées : {e}")
+        predictions_logged = 0
+
     return {
         "snapshot_id": snapshot_id,
         "skipped": False,
         "ingested_by": orchestrator(),
         "stations": silver.num_rows,
         "silver_rows_inserted": inserted,
+        "predictions_logged": predictions_logged,
         "bronze_file": bronze_file,
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Pipeline lakehouse Vélib'")
-    parser.add_argument("command", choices=["ingest", "maintain", "backfill", "embed", "forecast"])
+    parser.add_argument("command", choices=["ingest", "maintain", "backfill", "embed", "forecast", "external", "monitor"])
     args = parser.parse_args()
 
     if args.command == "ingest":
@@ -67,9 +78,15 @@ def main():
     elif args.command == "embed":
         from pipeline.embed import run_embed
         result = run_embed()
-    else:
+    elif args.command == "forecast":
         from pipeline.forecast import train_forecast
         result = train_forecast()
+    elif args.command == "external":
+        from pipeline.external import run_external
+        result = run_external()
+    else:
+        from pipeline.monitoring import evaluate_production
+        result = evaluate_production()
 
     print(json.dumps(result, ensure_ascii=False, default=str))
 

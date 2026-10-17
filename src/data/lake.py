@@ -54,10 +54,11 @@ def _connect():
     if lake_root().startswith("s3://"):
         con.execute("INSTALL httpfs; LOAD httpfs;")
         con.execute(
-            "CREATE OR REPLACE SECRET lake (TYPE s3, KEY_ID ?, SECRET ?, REGION ?)",
+            "CREATE OR REPLACE SECRET lake (TYPE s3, KEY_ID ?, SECRET ?, SESSION_TOKEN ?, REGION ?)",
             [
                 os.environ.get("AWS_ACCESS_KEY_ID", ""),
                 os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+                os.environ.get("AWS_SESSION_TOKEN", ""),
                 os.environ.get("AWS_REGION", "eu-north-1"),
             ],
         )

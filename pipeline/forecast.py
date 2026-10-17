@@ -89,13 +89,35 @@ def _evaluate(name: str, test: pd.DataFrame, scores: np.ndarray) -> dict:
     }
 
 
-def train_forecast(silver: pd.DataFrame | None = None) -> dict:
+def reference_distribution(frame: pd.DataFrame, features: list[str], bins: int = 10) -> dict:
+    """
+    Distribution de chaque feature sur le jeu d'entraînement (déciles) : sert de référence
+    pour mesurer la dérive des données en production (PSI).
+    """
+    reference = {}
+    for feature in features:
+        values = frame[feature].dropna().to_numpy(dtype=float)
+        if len(values) == 0:
+            continue
+        edges = np.unique(np.quantile(values, np.linspace(0, 1, bins + 1)))
+        if len(edges) < 2:  # variable constante : un seul intervalle
+            edges = np.array([values.min() - 0.5, values.max() + 0.5])
+        counts, _ = np.histogram(np.clip(values, edges[0], edges[-1]), bins=edges)
+        reference[feature] = {"edges": edges.round(6).tolist(), "proportions": (counts / counts.sum()).round(6).tolist()}
+    return reference
+
+
+def train_forecast(silver: pd.DataFrame | None = None, weather: pd.DataFrame | None = None,
+                   school: pd.DataFrame | None = None) -> dict:
     import lightgbm as lgb
 
+    from pipeline.external import read_school_holidays, read_weather
     from src.ml.features import FEATURES, LABEL, training_frame
     from src.ml.storage import model_uri, write_json, write_text
 
     silver = _read_silver() if silver is None else silver
+    weather = read_weather() if weather is None else weather
+    school = read_school_holidays() if school is None else school
     days = silver["date"].nunique() if "date" in silver else silver["ingested_at"].dt.date.nunique()
     if days < MIN_DAYS:
         result = {"status": "skipped", "reason": f"{days} jour{'s' if days > 1 else ''} d'historique sur {MIN_DAYS} requis", "days": int(days)}
@@ -103,7 +125,7 @@ def train_forecast(silver: pd.DataFrame | None = None) -> dict:
         write_json(model_uri(MODEL_NAME, "status.json"), {**result, "checked_at": datetime.now(timezone.utc)})
         return result
 
-    data = training_frame(silver).dropna(subset=[LABEL])
+    data = training_frame(silver, weather, school).dropna(subset=[LABEL])
     train, valid, test = _time_split(data)
     logger.info(f"Jeu d'entraînement : {len(train):,} / validation : {len(valid):,} / test : {len(test):,} lignes")
 
@@ -146,6 +168,8 @@ def train_forecast(silver: pd.DataFrame | None = None) -> dict:
         "features": FEATURES,
         "feature_importance_gain": importance,
         "evaluation": results,
+        "external_data": {"weather": weather is not None, "school_holidays": school is not None},
+        "reference_distribution": reference_distribution(train, FEATURES),
     }
 
     write_text(model_uri(MODEL_NAME, version, "model.txt"), model.booster_.model_to_string())
