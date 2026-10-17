@@ -9,6 +9,10 @@ Objectif :
 import json
 import os
 import re
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 import requests
@@ -27,6 +31,81 @@ DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "low")
 MIN_TOKENS_REASONING_MODEL = 1024
 _THINK_TAGS = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+# Tarifs Groq en $ par million de tokens (entrée, sortie), relevés sur /models.
+# Sur l'offre gratuite rien n'est facturé : c'est le coût équivalent en offre payante.
+PRICES_PER_MILLION = {
+    "openai/gpt-oss-120b": (0.15, 0.60),
+    "openai/gpt-oss-20b": (0.075, 0.30),
+    "qwen/qwen3.8-27b": (0.80, 4.00),
+}
+
+
+@dataclass
+class UsageReport:
+    """Consommation cumulée des appels LLM faits pendant un bloc `track_usage()`."""
+    calls: int = 0
+    errors: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    llm_seconds: float = 0.0
+    cost_usd: float = 0.0
+    models: set = field(default_factory=set)
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def as_dict(self) -> dict:
+        return {
+            "llm_calls": self.calls,
+            "llm_errors": self.errors,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "llm_seconds": round(self.llm_seconds, 2),
+            "cost_usd": round(self.cost_usd, 6),
+        }
+
+
+# Pile des mesures actives : un appel compte dans toutes (ex. l'assistant qui délègue à l'agent)
+_active_reports: ContextVar[tuple] = ContextVar("llm_usage", default=())
+
+
+@contextmanager
+def track_usage():
+    """Mesure tous les appels LLM faits dans le bloc (y compris HyDE, routeur, juge…)."""
+    report = UsageReport()
+    token = _active_reports.set(_active_reports.get() + (report,))
+    try:
+        yield report
+    finally:
+        _active_reports.reset(token)
+
+
+def _record_usage(model: str, usage: dict | None, seconds: float, error: bool = False) -> None:
+    usage = usage or {}
+    prompt, completion = usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0)
+    price_in, price_out = PRICES_PER_MILLION.get(model, (0.0, 0.0))
+    for report in _active_reports.get():
+        report.calls += 1
+        report.errors += int(error)
+        report.prompt_tokens += prompt
+        report.completion_tokens += completion
+        report.llm_seconds += seconds
+        report.cost_usd += (prompt * price_in + completion * price_out) / 1_000_000
+        report.models.add(model)
+
+
+MAX_RATE_LIMIT_RETRIES = 2
+
+
+def _retry_delay(response: requests.Response) -> float:
+    try:
+        return min(float(response.headers.get("retry-after", 5)), 20.0)
+    except (TypeError, ValueError):
+        return 5.0
 
 
 def _is_reasoning_model(model: str) -> bool:
@@ -95,18 +174,27 @@ def call_llm(
         payload["reasoning_effort"] = REASONING_EFFORT
         payload["max_tokens"] = max(max_tokens, MIN_TOKENS_REASONING_MODEL)
 
-    response = requests.post(
-        GROQ_URL,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-        },
-        json=payload,
-        timeout=timeout,
-    )
+    started = time.perf_counter()
+    for attempt in range(MAX_RATE_LIMIT_RETRIES + 1):
+        response = requests.post(
+            GROQ_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+            },
+            json=payload,
+            timeout=timeout,
+        )
+        # Limite de débit de l'offre gratuite : on attend le délai indiqué par Groq et on réessaie
+        if response.status_code != 429 or attempt == MAX_RATE_LIMIT_RETRIES:
+            break
+        time.sleep(_retry_delay(response))
 
+    if not response.ok:
+        _record_usage(model, None, time.perf_counter() - started, error=True)
     _raise_for_groq_error(response)
     data = response.json()
+    _record_usage(model, data.get("usage"), time.perf_counter() - started)
 
     # Réponse normalisée : texte sans réflexion, et pas de champ « reasoning »
     # (l'agent renvoie ce message à Groq lors du second appel)

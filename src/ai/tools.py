@@ -14,6 +14,8 @@ from src.reports.report_generator import generate_pdf_report
 
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
+# Le nombre total est transmis ; seul un échantillon de noms part au LLM
+MAX_LISTED_STATIONS = 15
 
 
 def get_station_info_tool(station_name: str, df: pd.DataFrame) -> dict:
@@ -78,7 +80,7 @@ def detect_anomalies_tool(df: pd.DataFrame) -> dict:
                 {
                     "type": "stations_vides_heure_pointe",
                     "heure": heure,
-                    "stations": vides,
+                    "stations": vides[:MAX_LISTED_STATIONS],
                     "count": len(vides),
                 }
             )
@@ -88,7 +90,7 @@ def detect_anomalies_tool(df: pd.DataFrame) -> dict:
         anomalies.append(
             {
                 "type": "stations_presque_pleines",
-                "stations": presque_pleines["name"].tolist(),
+                "stations": presque_pleines["name"].tolist()[:MAX_LISTED_STATIONS],
                 "count": len(presque_pleines),
             }
         )
@@ -98,7 +100,7 @@ def detect_anomalies_tool(df: pd.DataFrame) -> dict:
         anomalies.append(
             {
                 "type": "stations_vides",
-                "stations": vides["name"].tolist(),
+                "stations": vides["name"].tolist()[:MAX_LISTED_STATIONS],
                 "count": len(vides),
             }
         )

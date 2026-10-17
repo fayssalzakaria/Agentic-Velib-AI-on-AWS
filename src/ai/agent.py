@@ -6,7 +6,9 @@ import os
 import io
 import json
 import pandas as pd
-from llm_client import call_llm, verify_relevance
+import time
+
+from llm_client import call_llm, track_usage, verify_relevance
 import pytz
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -25,10 +27,16 @@ class AgentTrace:
     relevance_score: int = 0
     relevance_explanation: str = ""
     final_answer: str = ""
+    tool_rounds: int = 0
+    latency_s: float = 0.0
+    usage: dict = field(default_factory=dict)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 PARIS_TZ = pytz.timezone("Europe/Paris")
+# Le LLM reçoit le nombre total + un échantillon : envoyer des centaines de noms coûte des tokens pour rien
+MAX_LISTED_STATIONS = 15
+MAX_TOOL_ROUNDS = 3
 
 
 def _call_groq(messages: list, tools: list = None, max_tokens: int = 1000) -> dict:
@@ -130,7 +138,7 @@ def tool_detect_anomalies(df: pd.DataFrame) -> str:
             anomalies.append({
                 "type": "stations_vides_heure_pointe",
                 "heure": heure,
-                "stations": vides,  # toutes les stations
+                "stations": vides[:MAX_LISTED_STATIONS],
                 "count": len(vides),
             })
 
@@ -139,7 +147,7 @@ def tool_detect_anomalies(df: pd.DataFrame) -> str:
     if not presque_pleines.empty:
         anomalies.append({
             "type": "stations_presque_pleines",
-            "stations": presque_pleines["name"].tolist(),  # toutes
+            "stations": presque_pleines["name"].tolist()[:MAX_LISTED_STATIONS],
             "count": len(presque_pleines),
         })
 
@@ -148,7 +156,7 @@ def tool_detect_anomalies(df: pd.DataFrame) -> str:
     if not vides.empty:
         anomalies.append({
             "type": "stations_vides",
-            "stations": vides["name"].tolist(),
+            "stations": vides["name"].tolist()[:MAX_LISTED_STATIONS],
             "count": len(vides),
         })
 
@@ -225,113 +233,99 @@ TOOLS_SCHEMA = [
     },
 ]
 
+AGENT_SYSTEM_PROMPT = (
+    "Tu es un agent expert du réseau Vélib' à Paris. Tu disposes d'outils et tu choisis toi-même "
+    "lesquels appeler. Tu peux procéder en plusieurs étapes : par exemple consulter l'état actuel "
+    "d'une station, puis son historique pour dire si la situation est habituelle. "
+    "État actuel et anomalies : get_station_info, get_network_stats, detect_anomalies. "
+    "Habitudes et tendances : search_history. "
+    "N'invente aucune donnée. Réponds en français, de façon concise ; "
+    "quand tu listes des stations, cite les plus importantes (10 au maximum) et le nombre total."
+)
+
+
+def _execute_tool(name: str, args: dict, df, qdrant_client, rag_documents) -> str:
+    if name == "get_station_info":
+        return tool_get_station_info(args.get("station_name", ""), df)
+    if name == "get_network_stats":
+        return tool_get_network_stats(df)
+    if name == "search_history":
+        return tool_search_history(args.get("query", ""), qdrant_client, rag_documents)
+    if name == "detect_anomalies":
+        return tool_detect_anomalies(df)
+    return json.dumps({"error": f"Tool {name} inconnu"})
+
+
+def _format_messages(messages: list[dict]) -> str:
+    """Conversation envoyée au LLM, lisible dans la trace."""
+    return "\n".join(f"[{m['role'].upper()}] {m.get('content') or ''}" for m in messages if m.get("content"))
+
+
+def _agent_loop(question: str, df, qdrant_client, rag_documents, trace: AgentTrace) -> tuple[str, str]:
+    """
+    Boucle agentique : le LLM appelle des outils, lit les résultats et peut en rappeler
+    d'autres, jusqu'à MAX_TOOL_ROUNDS tours. Renvoie (réponse, données des outils).
+    """
+    messages = [
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
+    all_tool_data = []
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        message = _call_groq(messages, tools=TOOLS_SCHEMA)["choices"][0]["message"]
+        if not message.get("tool_calls"):
+            trace.prompt_sent = _format_messages(messages)
+            return message.get("content") or "Aucune réponse.", "\n".join(all_tool_data)
+
+        trace.tool_rounds += 1
+        messages.append({
+            "role": "assistant",
+            "content": message.get("content") or "",
+            "tool_calls": message["tool_calls"],
+        })
+        for tool_call in message["tool_calls"]:
+            name = tool_call["function"]["name"]
+            try:
+                args = json.loads(tool_call["function"].get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+
+            result = _execute_tool(name, args, df, qdrant_client, rag_documents)
+            trace.tools_called.append(name)
+            key = name if name not in trace.tool_results else f"{name} #{trace.tools_called.count(name)}"
+            trace.tool_results[key] = json.loads(result)
+            all_tool_data.append(f"[{name}] {result}")
+            messages.append({"role": "tool", "tool_call_id": tool_call["id"], "content": result})
+
+    # Nombre de tours atteint : réponse finale sans nouvel outil
+    trace.prompt_sent = _format_messages(messages)
+    message = _call_groq(messages)["choices"][0]["message"]
+    return message.get("content") or "Aucune réponse.", "\n".join(all_tool_data)
+
+
 def run_agent(question: str, df: pd.DataFrame, qdrant_client=None, rag_documents=None) -> tuple[str, AgentTrace]:
     trace = AgentTrace(question=question)
 
     if not GROQ_API_KEY:
         return "Cle Groq non configuree.", trace
 
-    messages = [
-    {
-    "role": "system",
-    "content": (
-        "Tu es un agent expert en mobilite urbaine specialise dans le reseau Velib Paris. "
-        "Tu utilises les tools disponibles pour repondre precisement aux questions. "
-        "Reponds toujours en francais de maniere concise et utile. "
-        "IMPORTANT : pour les questions sur les anomalies et l'etat actuel du reseau, "
-        "utilise detect_anomalies et get_network_stats qui analysent les donnees temps reel. "
-        "Pour les questions sur l'historique et les tendances, utilise search_history. "
-        "Quand tu listes des stations, cite-les TOUTES sans truncation. "
-        "Utilise plusieurs tools si necessaire pour donner une reponse complete."
-        ),
-    },
-        {"role": "user", "content": question},
-    ]
+    started = time.perf_counter()
+    with track_usage() as usage:
+        try:
+            answer, tool_data = _agent_loop(question, df, qdrant_client, rag_documents, trace)
+            trace.final_answer = trace.raw_response = answer
+            trace.relevance_score, trace.relevance_explanation = _verify_relevance(question, answer, tool_data)
+        except Exception as e:
+            answer = trace.final_answer = f"Erreur agent : {e}"
 
-    try:
-        response = _call_groq(messages, tools=TOOLS_SCHEMA)
-        choice = response["choices"][0]
-        message = choice["message"]
+    trace.latency_s = round(time.perf_counter() - started, 2)
+    trace.usage = usage.as_dict()
+    trace.prompt_tokens = usage.prompt_tokens
+    trace.completion_tokens = usage.completion_tokens
+    trace.total_tokens = usage.total_tokens
+    return answer, trace
 
-        # Tokens premier appel
-        usage = response.get("usage", {})
-        trace.prompt_tokens += usage.get("prompt_tokens", 0)
-        trace.completion_tokens += usage.get("completion_tokens", 0)
-
-        if not message.get("tool_calls"):
-            answer = message.get("content", "Aucune reponse.")
-            trace.final_answer = answer
-            trace.raw_response = answer
-            trace.total_tokens = trace.prompt_tokens + trace.completion_tokens
-            return answer, trace
-
-        messages.append(message)
-        all_tool_data = []
-
-        for tool_call in message["tool_calls"]:
-            tool_name = tool_call["function"]["name"]
-            trace.tools_called.append(tool_name)
-
-            try:
-                args = json.loads(tool_call["function"]["arguments"])
-            except Exception:
-                args = {}
-
-            if tool_name == "get_station_info":
-                result = tool_get_station_info(args.get("station_name", ""), df)
-            elif tool_name == "get_network_stats":
-                result = tool_get_network_stats(df)
-            elif tool_name == "search_history":
-                result = tool_search_history(
-                args.get("query", ""),
-                qdrant_client,
-                rag_documents,
-            )
-            
-            elif tool_name == "detect_anomalies":
-                result = tool_detect_anomalies(df)
-            else:
-                result = json.dumps({"error": f"Tool {tool_name} inconnu"})
-
-            trace.tool_results[tool_name] = json.loads(result)
-            all_tool_data.append(f"[{tool_name}] {result}")
-
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "content": result,
-            })
-
-        # Prompt final reconstruit
-        trace.prompt_sent = "\n".join([
-            f"[{m['role'].upper()}] {m.get('content', '') or ''}"
-            for m in messages
-            if m.get("content")
-        ])
-
-        final_response = _call_groq(messages)
-        answer = final_response["choices"][0]["message"].get("content", "Aucune reponse.")
-
-        # Tokens second appel
-        usage2 = final_response.get("usage", {})
-        trace.prompt_tokens += usage2.get("prompt_tokens", 0)
-        trace.completion_tokens += usage2.get("completion_tokens", 0)
-        trace.total_tokens = trace.prompt_tokens + trace.completion_tokens
-        trace.raw_response = answer
-        trace.final_answer = answer
-
-        # Vérification pertinence
-        tool_data_str = "\n".join(all_tool_data)
-        score, explanation = _verify_relevance(question, answer, tool_data_str)
-        trace.relevance_score = score
-        trace.relevance_explanation = explanation
-
-        return answer, trace
-
-    except Exception as e:
-        error_msg = f"Erreur agent : {e}"
-        trace.final_answer = error_msg
-        return error_msg, trace
 
 def _verify_relevance(question: str, answer: str, tool_data: str) -> tuple[int, str]:
     return verify_relevance(

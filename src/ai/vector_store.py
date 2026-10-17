@@ -9,7 +9,6 @@ import uuid
 
 import pandas as pd
 import pytz
-from llm_client import call_llm_text, verify_relevance
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
 QDRANT_URL = os.environ.get("QDRANT_URL", "")
@@ -152,53 +151,6 @@ def semantic_search(query: str, client, n_results: int = 8) -> list:
 
     except Exception as e:
         return [f"DEBUG semantic_search erreur : {e}"]
-
-def ask_with_qdrant(question: str, client) -> tuple[str, dict]:
-    groq_key = os.environ.get("GROQ_API_KEY", "")
-    if not groq_key:
-        return "Cle Groq non configuree.", {}
-
-    docs = semantic_search(question, client, n_results=8)
-    if not docs:
-        return "Aucune donnee pertinente trouvee dans l'historique.", {}
-
-    context = "\n".join(f"- {d}" for d in docs)
-    prompt = f"""Tu es un expert Velib Paris. Reponds en francais uniquement avec ces donnees.
-
-Donnees :
-{context}
-
-Question : {question}
-
-Reponds directement sans introduction."""
-
-    try:
-        answer, tokens = call_llm_text(
-            prompt,
-            max_tokens=500,
-            temperature=0.3,
-            timeout=30,
-        )
-
-        # Verification pertinence
-        score, explanation = _verify_relevance_semantic(question, answer, context[:500])
-
-        return answer, {
-            "tokens": tokens.get("total_tokens", 0),
-            "relevance_score": score,
-            "relevance_explanation": explanation,
-        }
-    except Exception as e:
-        return f"Erreur Groq : {e}", {}
-
-
-def _verify_relevance_semantic(question: str, answer: str, context: str) -> tuple[int, str]:
-    return verify_relevance(
-        question=question,
-        answer=answer,
-        context=context,
-        evaluator_name="recherche sémantique Vélib",
-    )
 
 def extract_station_from_query(query: str, client) -> str | None:
     if client is None:

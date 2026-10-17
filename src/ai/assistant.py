@@ -9,11 +9,12 @@ L'assistant route automatiquement les questions vers :
 - rapport
 """
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
-from llm_client import call_llm_text, verify_relevance
+from llm_client import call_llm_text, track_usage, verify_relevance
 from src.ai.prompts import FINAL_SYNTHESIS_PROMPT
 from src.ai.router import classify_question
 from src.ai.tools import (
@@ -39,6 +40,9 @@ class AssistantTrace:
     relevance_score: int | None = None
     relevance_explanation: str = ""
     final_answer: str = ""
+    delegated_to_agent: bool = False
+    latency_s: float = 0.0
+    usage: dict = field(default_factory=dict)
 
 
 def _extract_possible_station(question: str, df: pd.DataFrame) -> str | None:
@@ -112,8 +116,37 @@ def run_unified_assistant(
     use_llm_router: bool = False,
 ) -> tuple[str, AssistantTrace]:
     """
-    Point d'entrée principal de l'assistant IA unifié.
+    Point d'entrée de l'assistant : routage décidé par le code, puis outils, puis synthèse LLM.
+    Mesure la latence et la consommation de tous les appels LLM de la question.
     """
+    started = time.perf_counter()
+    with track_usage() as usage:
+        answer, trace = _run_assistant(
+            question, df,
+            qdrant_client=qdrant_client,
+            rag_documents=rag_documents,
+            qdrant_docs=qdrant_docs,
+            use_llm_router=use_llm_router,
+        )
+    trace.latency_s = round(time.perf_counter() - started, 2)
+    trace.usage = usage.as_dict()
+    trace.tokens = {
+        "prompt": usage.prompt_tokens,
+        "completion": usage.completion_tokens,
+        "total": usage.total_tokens,
+    }
+    return answer, trace
+
+
+def _run_assistant(
+    question: str,
+    df: pd.DataFrame,
+    *,
+    qdrant_client=None,
+    rag_documents=None,
+    qdrant_docs=None,
+    use_llm_router: bool = False,
+) -> tuple[str, AssistantTrace]:
     trace = AssistantTrace(question=question)
 
     routing = classify_question(question, use_llm=use_llm_router)
@@ -210,9 +243,18 @@ def run_unified_assistant(
             }
 
         else:
-            stats = get_network_stats_tool(df)
-            trace.tools_used.append("get_network_stats")
-            tool_outputs["get_network_stats"] = stats
+            # Question que les règles ne savent pas classer : on laisse l'agent choisir ses outils
+            from src.ai.agent import run_agent
+
+            answer, agent_trace = run_agent(question, df, qdrant_client, rag_documents)
+            trace.delegated_to_agent = True
+            trace.routing_reason += " Délégation à l'agent, qui choisit lui-même ses outils."
+            trace.tools_used = ["agent"] + agent_trace.tools_called
+            trace.tool_results = agent_trace.tool_results
+            trace.relevance_score = agent_trace.relevance_score
+            trace.relevance_explanation = agent_trace.relevance_explanation
+            trace.final_answer = answer
+            return answer, trace
 
         trace.tool_results = tool_outputs
 
@@ -247,13 +289,6 @@ def run_unified_assistant(
         return trace.final_answer, trace
 
 
-
-
-    except Exception as e:
-        error = f"Erreur assistant IA : {e}"
-        trace.final_answer = error
-        return error, trace
-        
 def _evaluate_unified_answer(
     question: str,
     answer: str,

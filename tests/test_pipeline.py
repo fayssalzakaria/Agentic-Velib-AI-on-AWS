@@ -131,6 +131,7 @@ class _FakeResponse:
     def __init__(self, status, body):
         self.status_code, self._body = status, body
         self.ok, self.reason, self.text = status < 400, "error", str(body)
+        self.headers = {"retry-after": "0"}
 
     def json(self):
         return self._body
@@ -169,3 +170,25 @@ def test_groq_error_message_is_explicit(monkeypatch):
     llm, _ = _fake_groq(monkeypatch, status=404, body=body)
     with pytest.raises(RuntimeError, match="Groq 404 : The model"):
         llm.call_llm([{"role": "user", "content": "salut"}])
+
+
+def test_track_usage_sums_calls_tokens_and_cost(monkeypatch):
+    body = {"choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 500}}
+    llm, _ = _fake_groq(monkeypatch, body=body)
+
+    with llm.track_usage() as usage:
+        llm.call_llm([{"role": "user", "content": "a"}], model="openai/gpt-oss-120b")
+        llm.call_llm([{"role": "user", "content": "b"}], model="openai/gpt-oss-120b")
+
+    assert usage.calls == 2 and usage.total_tokens == 3000
+    # 2 x (1000 x 0.15 + 500 x 0.60) / 1e6
+    assert abs(usage.cost_usd - 0.0009) < 1e-9
+    # mesures imbriquées : l'appel compte dans les deux
+    with llm.track_usage() as outer:
+        with llm.track_usage() as inner:
+            llm.call_llm([{"role": "user", "content": "d"}], model="openai/gpt-oss-120b")
+    assert outer.calls == inner.calls == 1
+    # hors d'un bloc track_usage, rien n'est compté
+    llm.call_llm([{"role": "user", "content": "c"}], model="openai/gpt-oss-120b")
+    assert usage.calls == 2

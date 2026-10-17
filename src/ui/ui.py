@@ -1,6 +1,5 @@
-import os
 from datetime import datetime
-from src.ai.assistant import run_unified_assistant
+
 import pandas as pd
 import plotly.express as px
 import pydeck as pdk
@@ -8,14 +7,12 @@ import pytz
 import streamlit as st
 
 from config import MODE_HISTORY, MODE_REALTIME, PARIS_TIMEZONE
-from src.ai.chatbot import ask_groq, build_context
 from src.data import lake
 from src.data.filters import search_stations
 from src.data.data_loader import fetch_api_snapshot
 from src.data.history import get_lake_status
-from src.ai.vector_store import extract_station_from_query, build_qdrant_index, ask_with_qdrant
-from src.ai.nlp_utils import normalize_text, extract_keywords, detect_time_expression
-from src.ai.router import classify_question
+
+
 def render_sidebar():
     """Choix du mode ; les filtres ne concernent que le snapshot temps réel."""
     st.sidebar.title("Configuration")
@@ -67,16 +64,44 @@ def get_session_snapshot(refresh: bool = False) -> pd.DataFrame | None:
     return st.session_state.snapshot_df
 
 
-def render_snapshot_header() -> pd.DataFrame | None:
-    """Heure du snapshot + bouton pour en prendre un nouveau."""
-    col_info, col_button = st.columns([4, 1])
+SNAPSHOT_BUTTON_PREFIX = "snapshot_refresh_"
+
+
+def handle_snapshot_refresh() -> None:
+    """À appeler en tout début de page : un clic sur n'importe quel bouton « Récupérer » reprend le snapshot."""
+    if any(v for k, v in st.session_state.items() if str(k).startswith(SNAPSHOT_BUTTON_PREFIX)):
+        get_session_snapshot(refresh=True)
+
+
+def _snapshot_age() -> str:
+    seconds = (datetime.now(pytz.timezone(PARIS_TIMEZONE)) - st.session_state.snapshot_at).total_seconds()
+    if seconds < 60:
+        return "à l'instant"
+    if seconds < 3600:
+        return f"il y a {int(seconds // 60)} min"
+    return f"il y a {int(seconds // 3600)} h {int(seconds % 3600 // 60):02d}"
+
+
+def render_snapshot_bar(key: str, label: str = "Données temps réel") -> pd.DataFrame | None:
+    """
+    Bandeau « heure et âge du snapshot » + bouton pour en récupérer un nouveau.
+    `key` distingue les boutons quand le bandeau apparaît deux fois sur la page.
+    """
+    col_info, col_button = st.columns([3, 1])
     with col_button:
-        refresh = st.button("🔄 Rafraîchir le snapshot", use_container_width=True)
-    df = get_session_snapshot(refresh=refresh)
+        # Le clic est traité en début de page (handle_snapshot_refresh) pour que tous les bandeaux
+        # affichent le même snapshot
+        st.button(
+            "📡 Récupérer un nouveau snapshot",
+            key=f"{SNAPSHOT_BUTTON_PREFIX}{key}",
+            type="primary",
+            use_container_width=True,
+        )
+    df = get_session_snapshot()
     if df is not None:
-        col_info.caption(
-            f"Snapshot pris le {st.session_state.snapshot_at:%d/%m/%Y à %H:%M:%S} — "
-            f"{len(df)} stations (API Open Data Vélib')"
+        col_info.info(
+            f"**{label}** : snapshot du {st.session_state.snapshot_at:%d/%m/%Y à %H:%M:%S} "
+            f"({_snapshot_age()}) — {len(df)} stations, API Open Data Vélib'"
         )
     return df
 
@@ -225,30 +250,6 @@ def render_charts(df_filtered):
 
     st.divider()
 
-def render_chatbot(df_filtered):
-    st.subheader("Ask Velib Data")
-
-    context = build_context(df_filtered)
-
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
-
-    if question := st.chat_input("Ex: Quelle station a le plus de velos electriques ?"):
-        st.session_state.messages.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.write(question)
-        with st.chat_message("assistant"):
-            with st.spinner("Analyse en cours..."):
-                response = ask_groq(question, context)
-            st.write(response)
-            st.session_state.messages.append({"role": "assistant", "content": response})
-
-    st.divider()
-
 def render_downloads(df_filtered):
     st.subheader("Telechargements")
 
@@ -332,243 +333,6 @@ def render_station_detail(df_filtered):
     st.divider()
 
 
-def _get_qdrant_client_cached():
-    if "qdrant_client" not in st.session_state:
-        with st.spinner("Connexion Qdrant Cloud..."):
-            client, n = build_qdrant_index()
-            st.session_state.qdrant_client = client
-            st.session_state.qdrant_docs = n
-    return st.session_state.get("qdrant_client"), st.session_state.get("qdrant_docs", 0)
-
-
-@st.cache_resource(ttl=3600, show_spinner=False)
-def _shared_rag_index():
-    """Index RAG (documents + embeddings) partagé entre toutes les sessions, reconstruit au plus 1x/h."""
-    from src.ai.rag import build_rag_index
-    return build_rag_index()
-
-
-def _ensure_rag_documents():
-    if "rag_documents" not in st.session_state:
-        with st.spinner("Chargement des profils de stations (gold)..."):
-            docs, n_docs = _shared_rag_index()
-            st.session_state.rag_documents = docs
-            st.session_state.rag_docs = n_docs
-    return st.session_state.rag_documents
-
-
-def _render_rag_content(df_filtered=None):
-    st.info("Pour les questions sur l'etat actuel d'une station (anomalies, disponibilite), utilisez l'onglet Agent IA qui a acces aux donnees temps reel.")
-
-    if not _ensure_rag_documents():
-        st.info("Historique indisponible : aucun profil de station dans le lakehouse. Chatbot sur les données temps réel :")
-        render_chatbot(df_filtered)
-        return
-
-    if st.session_state.rag_documents:
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            rag_docs = st.session_state.get("rag_docs", 0)
-            st.caption(
-                f"Index RAG : {rag_docs} profils de stations — "
-                f"HyDE + BM25 + Cosine + RRF + MMR + Reranking"
-            )
-        with col2:
-            if st.button("Rafraichir index"):
-                _shared_rag_index.clear()
-                for key in ["rag_documents", "rag_docs"]:
-                    if key in st.session_state:
-                        del st.session_state[key]
-                st.rerun()
-
-    if "rag_messages" not in st.session_state:
-        st.session_state.rag_messages = []
-    if "rag_traces" not in st.session_state:
-        st.session_state.rag_traces = []
-
-    for i, msg in enumerate(st.session_state.rag_messages):
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
-
-        if msg["role"] == "assistant" and i // 2 < len(st.session_state.rag_traces):
-            trace = st.session_state.rag_traces[i // 2]
-            if trace:
-                with st.expander("Details du pipeline RAG", expanded=False):
-                    st.caption(f"Techniques : {' → '.join(trace.get('techniques_used', []))}")
-
-                    col1, col2, col3 = st.columns(3)
-                    tokens = trace.get("tokens", {})
-                    col1.metric("Tokens total", tokens.get("total", 0))
-                    col2.metric("Prompt tokens", tokens.get("prompt", 0))
-                    col3.metric("Completion tokens", tokens.get("completion", 0))
-
-                    if trace.get("hyde_query"):
-                        with st.expander("Query HyDE expandée"):
-                            st.text(trace["hyde_query"])
-
-                    col_a, col_b = st.columns(2)
-                    with col_a:
-                        if trace.get("bm25_top5"):
-                            st.caption("Top 5 BM25 :")
-                            for s in trace["bm25_top5"]:
-                                st.caption(f"  • {s}")
-                    with col_b:
-                        if trace.get("cosine_top5"):
-                            st.caption("Top 5 Cosine :")
-                            for s in trace["cosine_top5"]:
-                                st.caption(f"  • {s}")
-
-                    if trace.get("final_docs"):
-                        st.caption("Sources finales utilisées :")
-                        for s in trace["final_docs"]:
-                            st.caption(f"  • {s}")
-
-    question = st.chat_input(
-        "Ex: Bastille est-elle souvent vide le matin ?",
-        key="rag_input",
-    )
-
-    if question:
-        st.session_state.rag_messages.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.write(question)
-        with st.chat_message("assistant"):
-            with st.spinner("Pipeline RAG en cours — HyDE + BM25 + Cosine + RRF + MMR + Reranking..."):
-                from src.ai.rag import ask_rag_with_qdrant_context
-                from src.ai.vector_store import semantic_search
-                qdrant_client, _ = _get_qdrant_client_cached()
-                qdrant_docs = semantic_search(question, qdrant_client, n_results=10) if qdrant_client else []
-                response, trace = ask_rag_with_qdrant_context(
-                    question,
-                    st.session_state.get("rag_documents"),
-                    qdrant_docs,
-                )
-                st.session_state.rag_traces.append(trace)
-            st.write(response)
-            if trace and trace.get("relevance_score") is not None:
-                score = trace["relevance_score"]
-                color = "green" if score >= 80 else "orange" if score >= 50 else "red"
-                st.markdown(
-                    f"**Pertinence : <span style='color:{color}'>{score}/100</span>** — {trace.get('relevance_explanation','')}",
-                    unsafe_allow_html=True,
-                )
-            st.session_state.rag_messages.append({"role": "assistant", "content": response})
-        st.rerun()
-
-def _render_agent_content(df_filtered):
-    qdrant_client, _ = _get_qdrant_client_cached()
-    rag_documents = st.session_state.get("rag_documents")
-
-    if "agent_messages" not in st.session_state:
-        st.session_state.agent_messages = []
-    if "agent_traces" not in st.session_state:
-        st.session_state.agent_traces = []
-
-    for i, msg in enumerate(st.session_state.agent_messages):
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
-
-        if msg["role"] == "assistant" and i // 2 < len(st.session_state.agent_traces):
-            trace = st.session_state.agent_traces[i // 2]
-            with st.expander("Details de l'execution", expanded=False):
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Tokens total", trace.total_tokens)
-                col2.metric("Prompt tokens", trace.prompt_tokens)
-                col3.metric("Completion tokens", trace.completion_tokens)
-
-                st.caption(f"Tools utilises : {', '.join(trace.tools_called) if trace.tools_called else 'aucun'}")
-
-                if trace.tool_results:
-                    for tool_name, result in trace.tool_results.items():
-                        with st.expander(f"Resultat : {tool_name}"):
-                            if tool_name == "search_history":
-                                techniques = result.get("techniques_utilisees", [])
-                                if techniques:
-                                    st.caption(f"Techniques : {' → '.join(techniques)}")
-                                sources = result.get("sources", [])
-                                if sources:
-                                    st.caption("Sources :")
-                                    for s in sources:
-                                        st.caption(f"  • {s}")
-                            else:
-                                st.json(result)
-
-                if trace.prompt_sent:
-                    with st.expander("Prompt envoye au LLM"):
-                        st.text(trace.prompt_sent[:2000])
-
-                score = trace.relevance_score
-                color = "green" if score >= 80 else "orange" if score >= 50 else "red"
-                st.markdown(
-                    f"**Pertinence : <span style='color:{color}'>{score}/100</span>**",
-                    unsafe_allow_html=True,
-                )
-                if trace.relevance_explanation:
-                    st.caption(trace.relevance_explanation)
-
-    question = st.chat_input(
-        "Ex: Y a-t-il des anomalies ? Analyse Bastille sur l'historique.",
-        key="agent_input",
-    )
-
-    if question:
-        st.session_state.agent_messages.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.write(question)
-        with st.chat_message("assistant"):
-            with st.spinner("Agent en cours — HyDE + BM25 + Cosine + RRF + MMR si historique requis..."):
-                from src.ai.agent import run_agent
-                response, trace = run_agent(
-                    question, df_filtered, qdrant_client, rag_documents
-                )
-                st.session_state.agent_traces.append(trace)
-            st.write(response)
-            st.session_state.agent_messages.append(
-                {"role": "assistant", "content": response}
-            )
-        st.rerun()
-
-def _render_semantic_content():
-    qdrant_client, qdrant_docs = _get_qdrant_client_cached()
-
-    if qdrant_client is None:
-        st.info("Qdrant non configure ou pas de snapshots disponibles.")
-        return
-
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        st.caption(f"Index Qdrant : {qdrant_docs} documents")
-    with col2:
-        if st.button("Rafraichir Qdrant"):
-            for key in ["qdrant_client", "qdrant_docs"]:
-                if key in st.session_state:
-                    del st.session_state[key]
-            st.rerun()
-
-    query = st.text_input(
-        "Recherche",
-        placeholder="Ex: stations vides le matin, patterns weekend...",
-        key="qdrant_search",
-    )
-
-    if not query:
-        return
-
-    with st.spinner("Recherche semantique..."):
-        response, sem_trace = ask_with_qdrant(query, qdrant_client)
-
-    st.write(response)
-
-    if sem_trace.get("relevance_score") is not None:
-        score = sem_trace["relevance_score"]
-        color = "green" if score >= 80 else "orange" if score >= 50 else "red"
-        st.caption(f"Tokens : {sem_trace.get('tokens', 0)}")
-        st.markdown(
-            f"**Pertinence : <span style='color:{color}'>{score}/100</span>** — {sem_trace.get('relevance_explanation','')}",
-            unsafe_allow_html=True,
-        )
-
-
 def render_lake_sidebar():
     st.sidebar.divider()
     st.sidebar.subheader("Lakehouse")
@@ -586,216 +350,3 @@ def render_lake_sidebar():
         f"{status['snapshots']} snapshots — dernier à "
         f"{status['last_snapshot']:%H:%M} ({status['last_ingested_by']})"
     )
-
-def _render_unified_assistant_content(df_filtered):
-    st.info(
-        "Assistant IA unifié : il choisit automatiquement entre temps réel, anomalies, RAG historique et recherche sémantique."
-    )
-
-    qdrant_client, _ = _get_qdrant_client_cached()
-
-    try:
-        _ensure_rag_documents()
-    except Exception:
-        st.session_state.rag_documents = None
-        st.session_state.rag_docs = 0
-
-    if "unified_messages" not in st.session_state:
-        st.session_state.unified_messages = []
-
-    if "unified_traces" not in st.session_state:
-        st.session_state.unified_traces = []
-
-    for i, msg in enumerate(st.session_state.unified_messages):
-        with st.chat_message(msg["role"]):
-            st.write(msg["content"])
-
-        if msg["role"] == "assistant":
-            trace_index = i // 2
-
-            if trace_index < len(st.session_state.unified_traces):
-                trace = st.session_state.unified_traces[trace_index]
-
-                with st.expander("Détails assistant IA", expanded=False):
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("Intention", trace.intent)
-                    col2.metric("Confiance", f"{trace.confidence:.0%}")
-                    col3.metric("Tools", len(trace.tools_used))
-
-                    st.caption(f"Raison du routage : {trace.routing_reason}")
-                    from src.ai.nlp_utils import extract_keywords, detect_time_expression, normalize_text
-
-                    st.subheader("Analyse NLP")
-
-                    st.caption("Question normalisée :")
-                    st.code(normalize_text(trace.question))
-
-                    keywords = extract_keywords(trace.question)
-                    time_expressions = detect_time_expression(trace.question)
-
-                    st.caption("Mots-clés :")
-                    st.write(", ".join(keywords) if keywords else "Aucun mot-clé détecté")
-
-                    st.caption("Expressions temporelles :")
-                    st.write(", ".join(time_expressions) if time_expressions else "Aucune expression temporelle détectée")
-
-                    if trace.tools_used:
-                        st.caption(f"Outils utilisés : {', '.join(trace.tools_used)}")
-
-                    if trace.tokens:
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Tokens total", trace.tokens.get("total", 0))
-                        c2.metric("Prompt", trace.tokens.get("prompt", 0))
-                        c3.metric("Completion", trace.tokens.get("completion", 0))
-
-                    if trace.relevance_score is not None:
-                        color = (
-                            "green"
-                            if trace.relevance_score >= 80
-                            else "orange"
-                            if trace.relevance_score >= 50
-                            else "red"
-                        )
-
-                        st.markdown(
-                            f"**Pertinence : <span style='color:{color}'>{trace.relevance_score}/100</span>**",
-                            unsafe_allow_html=True,
-                        )
-
-                        if trace.relevance_explanation:
-                            st.caption(trace.relevance_explanation)
-
-                    if trace.tool_results:
-                        for tool_name, result in trace.tool_results.items():
-                            with st.expander(f"Résultat outil : {tool_name}"):
-                                st.json(result)
-
-    question = st.chat_input(
-        "Ex: Y a-t-il des anomalies maintenant ? Bastille est-elle souvent vide le matin ?",
-        key="unified_assistant_input",
-    )
-
-    if question:
-        st.session_state.unified_messages.append(
-            {"role": "user", "content": question}
-        )
-
-        with st.chat_message("user"):
-            st.write(question)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Assistant IA en cours..."):
-                from src.ai.vector_store import semantic_search
-
-                qdrant_docs = (
-                    semantic_search(question, qdrant_client, n_results=10)
-                    if qdrant_client
-                    else []
-                )
-
-                response, trace = run_unified_assistant(
-                    question,
-                    df_filtered,
-                    qdrant_client=qdrant_client,
-                    rag_documents=st.session_state.get("rag_documents"),
-                    qdrant_docs=qdrant_docs,
-                    use_llm_router=False,
-                )
-
-                st.session_state.unified_traces.append(trace)
-
-            st.write(response)
-
-            st.session_state.unified_messages.append(
-                {"role": "assistant", "content": response}
-            )
-
-        st.rerun()
-
-def _render_nlp_content():
-    st.info(
-        "Analyse NLP locale : normalisation, extraction de mots-clés, détection temporelle et routage d'intention."
-    )
-
-    question = st.text_input(
-        "Question à analyser",
-        placeholder="Ex: Bastille est-elle souvent vide le matin ?",
-        key="nlp_analysis_input",
-    )
-
-    if not question:
-        return
-
-    normalized = normalize_text(question)
-    keywords = extract_keywords(question)
-    time_expressions = detect_time_expression(question)
-    routing = classify_question(question, use_llm=False)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("Texte normalisé")
-        st.code(normalized)
-
-        st.subheader("Mots-clés extraits")
-        if keywords:
-            st.write(", ".join(keywords))
-        else:
-            st.warning("Aucun mot-clé détecté.")
-
-    with col2:
-        st.subheader("Expressions temporelles")
-        if time_expressions:
-            st.write(", ".join(time_expressions))
-        else:
-            st.info("Aucune expression temporelle détectée.")
-
-        st.subheader("Intention détectée")
-        st.metric("Intent", routing.get("intent", "unknown"))
-        st.metric("Confiance", f"{routing.get('confidence', 0):.0%}")
-        st.caption(routing.get("reason", ""))
-
-    with st.expander("Résultat NLP complet"):
-        st.json(
-            {
-                "question": question,
-                "normalized": normalized,
-                "keywords": keywords,
-                "time_expressions": time_expressions,
-                "routing": routing,
-            }
-        )
-
-def render_ai_tabs(df_filtered):
-    st.subheader("Intelligence Artificielle")
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Assistant IA",
-        "Analyse NLP",
-        "Chatbot RAG",
-        "Agent IA",
-        "Recherche sémantique",
-    ])
-
-    with tab1:
-        st.caption("Assistant unifié avec routage automatique vers les bons outils")
-        _render_unified_assistant_content(df_filtered)
-
-    with tab2:
-        st.caption("Analyse locale du langage naturel utilisée par le routeur")
-        _render_nlp_content()
-
-    with tab3:
-        st.caption("Posez des questions sur l'historique des stations")
-        _render_rag_content(df_filtered)
-
-    with tab4:
-        st.caption("L'agent choisit automatiquement les bons outils")
-        st.caption("Tools : get_station_info · get_network_stats · search_history · detect_anomalies")
-        _render_agent_content(df_filtered)
-
-    with tab5:
-        st.caption("Recherche sémantique sur les patterns historiques")
-        _render_semantic_content()
-
-    st.divider()
