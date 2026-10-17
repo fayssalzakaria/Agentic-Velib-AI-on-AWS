@@ -120,15 +120,6 @@ def station_history(station_name: str, hours: int) -> pd.DataFrame:
     return df
 
 
-def available_stations(hours: int = 24) -> list[str]:
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
-    df = query(
-        f"SELECT DISTINCT name FROM {_silver()} WHERE date >= ? AND ingested_at >= ? ORDER BY name",
-        [since.astimezone(PARIS_TZ).strftime("%Y-%m-%d"), since],
-    )
-    return df["name"].tolist() if not df.empty else []
-
-
 def latest_snapshot() -> pd.DataFrame:
     """Dernier snapshot du silver : secours quand l'API temps réel est injoignable."""
     df = query(f"""

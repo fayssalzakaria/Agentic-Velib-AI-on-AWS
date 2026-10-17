@@ -11,7 +11,6 @@ import pytz
 from llm_client import call_llm_text
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 PARIS_TZ = pytz.timezone("Europe/Paris")
 
 

@@ -2,16 +2,12 @@
 rag.py — RAG avancé avec Hybrid Search + Reranking + MMR + HyDE + Citations
 """
 import os
-import json
-import math
 import numpy as np
 import pandas as pd
 from llm_client import call_llm_text, call_llm_json, verify_relevance
 import pytz
-from datetime import datetime
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 PARIS_TZ = pytz.timezone("Europe/Paris")
 
 

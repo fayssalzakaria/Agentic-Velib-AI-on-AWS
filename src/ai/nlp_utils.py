@@ -61,18 +61,3 @@ def detect_time_expression(text: str) -> List[str]:
             expressions.append(keyword)
 
     return expressions
-
-
-def enrich_query_for_rag(question: str) -> str:
-    keywords = extract_keywords(question)
-    time_expressions = detect_time_expression(question)
-
-    parts = [question]
-
-    if keywords:
-        parts.append(f"Mots-clés NLP : {', '.join(keywords)}")
-
-    if time_expressions:
-        parts.append(f"Expressions temporelles : {', '.join(time_expressions)}")
-
-    return "\n".join(parts)

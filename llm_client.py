@@ -128,13 +128,6 @@ def _raise_for_groq_error(response: requests.Response) -> None:
     raise RuntimeError(f"Groq {response.status_code} : {detail or response.reason}")
 
 
-def is_llm_configured() -> bool:
-    """
-    Vérifie si la clé Groq est disponible.
-    """
-    return bool(GROQ_API_KEY)
-
-
 def call_llm(
     messages: list[dict[str, Any]],
     *,
@@ -303,24 +296,6 @@ def call_llm_json(
         raise ValueError(
             f"Réponse LLM non JSON valide : {cleaned}"
         ) from e
-
-
-def extract_answer_and_tokens(data: dict[str, Any]) -> tuple[str, dict[str, int]]:
-    """
-    Extrait le contenu texte et les tokens depuis une réponse Groq complète.
-    Utile pour agent.py quand on utilise directement call_llm avec tools.
-    """
-
-    answer = data["choices"][0]["message"].get("content", "")
-    usage = data.get("usage", {})
-
-    tokens = {
-        "prompt": usage.get("prompt_tokens", 0),
-        "completion": usage.get("completion_tokens", 0),
-        "total": usage.get("total_tokens", 0),
-    }
-
-    return answer, tokens
 
 
 def verify_relevance(

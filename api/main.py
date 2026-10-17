@@ -11,7 +11,6 @@ import os
 import sys
 from functools import lru_cache
 from typing import Optional, Dict, Any
-import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel
 
