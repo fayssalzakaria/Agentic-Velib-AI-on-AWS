@@ -1,6 +1,6 @@
 name: daily-fallback
 
-# Job quotidien de SECOURS : compaction Delta (OPTIMIZE + VACUUM) puis modèles gold dbt.
+# Job quotidien de SECOURS : compaction Delta (OPTIMIZE + VACUUM), modèles gold dbt, puis embeddings.
 # Le principal est le DAG Airflow velib_daily_gold (02:15, heure de Paris), qui écrit
 # lake/_control/daily/<date>.json. Ici (06:30 à Paris) on ne relance rien si le marqueur existe.
 # Le gold n'est pas recalculé chaque heure pour limiter la sortie de données S3.
@@ -68,6 +68,24 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         working-directory: dbt
         run: dbt build --profiles-dir . --target prod
+
+      # Embeddings des profils calculés ici, une fois par jour : l'application n'encode
+      # plus que la question de l'utilisateur
+      - name: Cache des modèles Hugging Face
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ hashFiles('src/ai/embeddings.py') }}
+
+      - name: Embeddings des profils de stations (+ Qdrant)
+        if: steps.check.outputs.skip != 'true'
+        env:
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+        run: |
+          pip install -r pipeline/requirements-embed.txt
+          python -m pipeline.run embed
 
       - name: Marqueur de fin
         if: steps.check.outputs.skip != 'true'

@@ -1,0 +1,6 @@
+# Job d'embeddings (pipeline.run embed) : en plus de requirements.txt
+# Roues CPU de PyTorch : évite de télécharger la version CUDA (plusieurs Go)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1
+sentence-transformers==6.1.0
+qdrant-client==1.19.1

@@ -4,6 +4,7 @@ run.py — Point d'entrée du pipeline (exécuté par GitHub Actions).
     python -m pipeline.run ingest     # API -> bronze -> silver
     python -m pipeline.run maintain   # OPTIMIZE + VACUUM de la table silver
     python -m pipeline.run backfill   # importe les anciens CSV S3 dans silver
+    python -m pipeline.run embed      # embeddings des profils gold (+ Qdrant)
 """
 import argparse
 import json
@@ -52,16 +53,19 @@ def ingest() -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="Pipeline lakehouse Vélib'")
-    parser.add_argument("command", choices=["ingest", "maintain", "backfill"])
+    parser.add_argument("command", choices=["ingest", "maintain", "backfill", "embed"])
     args = parser.parse_args()
 
     if args.command == "ingest":
         result = ingest()
     elif args.command == "maintain":
         result = maintain_silver()
-    else:
+    elif args.command == "backfill":
         from pipeline.backfill import backfill
         result = backfill()
+    else:
+        from pipeline.embed import run_embed
+        result = run_embed()
 
     print(json.dumps(result, ensure_ascii=False, default=str))
 

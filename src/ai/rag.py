@@ -338,8 +338,24 @@ def hybrid_search(
     return final_docs, trace
 
 
+def load_precomputed_documents() -> list[dict]:
+    """Documents + vecteurs calculés chaque nuit par le pipeline (gold/station_profile_embeddings)."""
+    from src.ai.embeddings import EMBEDDING_MODEL
+    from src.ai.profile_docs import documents_from_frame
+    from src.data.lake import station_embeddings
+
+    return documents_from_frame(station_embeddings(), EMBEDDING_MODEL)
+
+
 def build_rag_index(profiles: pd.DataFrame = None):
-    """Un document par station, construit depuis le gold ; embeddings précalculés une fois."""
+    """
+    Index RAG : un document par station. Les vecteurs viennent du pipeline (aucun calcul lourd
+    dans l'application) ; en secours seulement (gold pas encore calculé), on encode localement.
+    """
+    documents = load_precomputed_documents()
+    if documents:
+        return documents, len(documents)
+
     from src.ai.profile_docs import station_documents
 
     if profiles is None or profiles.empty:
@@ -357,6 +373,7 @@ def build_rag_index(profiles: pd.DataFrame = None):
         pass
 
     return documents, len(documents)
+
 
 def ask_rag(question: str, documents) -> tuple[str, dict]:
     """

@@ -32,6 +32,9 @@ x-airflow-common: &airflow-common
     - ./logs:/opt/airflow/logs
     - ../pipeline:/opt/project/pipeline:ro
     - ../dbt:/opt/project/dbt:ro
+    # src/ : le job d'embeddings réutilise le code de l'application (documents, modèle)
+    - ../src:/opt/project/src:ro
+    - hf-cache:/home/airflow/.cache/huggingface
     - ../lake:/opt/project/lake
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on: &airflow-common-depends-on
@@ -107,3 +110,4 @@ services:
 
 volumes:
   postgres-db:
+  hf-cache:

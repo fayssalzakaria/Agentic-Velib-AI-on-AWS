@@ -7,7 +7,6 @@ La collection est reconstruite automatiquement quand le gold change.
 import os
 import uuid
 
-import pandas as pd
 import pytz
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
@@ -50,59 +49,55 @@ def _indexed_version(client) -> str:
         return ""
 
 
-def build_qdrant_index(profiles: pd.DataFrame = None):
+def index_documents(client, documents: list[dict], version: str) -> int:
+    """(Ré)indexe Qdrant avec des documents dont le vecteur est déjà calculé (doc["embedding"])."""
+    from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
+
+    if _collection_exists(client):
+        client.delete_collection(COLLECTION_NAME)
+    client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=len(documents[0]["embedding"]), distance=Distance.COSINE),
+    )
+    client.create_payload_index(
+        collection_name=COLLECTION_NAME,
+        field_name="station",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    points = [
+        PointStruct(
+            id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"velib/{doc['metadata']['station_id']}")),
+            vector=[float(x) for x in doc["embedding"]],
+            payload={**doc["metadata"], "text": doc["text"], "profiles_version": version},
+        )
+        for doc in documents
+    ]
+    for i in range(0, len(points), 100):
+        client.upsert(collection_name=COLLECTION_NAME, points=points[i:i + 100])
+    return _collection_count(client)
+
+
+def build_qdrant_index(documents: list[dict] | None = None):
     """
-    Connexion à Qdrant ; réindexe seulement si le gold a changé depuis la dernière indexation.
-    Renvoie (client, nombre de points).
+    Côté application : se connecte à Qdrant sans jamais encoder de documents.
+    L'index est tenu à jour par le pipeline (pipeline/embed.py) ; si la collection manque,
+    on la recrée à partir des vecteurs précalculés du gold. Renvoie (client, nombre de points).
     """
     try:
-        from qdrant_client.models import Distance, PayloadSchemaType, PointStruct, VectorParams
-        from src.ai.embeddings import EMBEDDING_MODEL, embed_passages
-        from src.ai.profile_docs import profiles_version, station_documents
-        from src.data.lake import station_period_profiles
-
         client = _get_qdrant_client()
         if client is None:
             return None, 0
 
-        if profiles is None or profiles.empty:
-            profiles = station_period_profiles()
-        # Changer de modèle d'embeddings impose aussi de réindexer
-        version = f"{profiles_version(profiles)}|{EMBEDDING_MODEL}"
+        if documents is None:
+            from src.ai.rag import load_precomputed_documents
+            documents = load_precomputed_documents()
 
-        if _collection_exists(client):
-            if not profiles_version(profiles) or _indexed_version(client) == version:
-                return client, _collection_count(client)
-            client.delete_collection(COLLECTION_NAME)
-
-        documents = station_documents(profiles)
+        version = documents[0]["profiles_version"] if documents else ""
+        if _collection_exists(client) and (not version or _indexed_version(client) == version):
+            return client, _collection_count(client)
         if not documents:
-            return client, 0
-
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-        )
-        client.create_payload_index(
-            collection_name=COLLECTION_NAME,
-            field_name="station",
-            field_schema=PayloadSchemaType.KEYWORD,
-        )
-
-        embeddings = embed_passages([d["text"] for d in documents])
-
-        points = [
-            PointStruct(
-                id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"velib/{doc['metadata']['station_id']}")),
-                vector=embedding.tolist(),
-                payload={**doc["metadata"], "text": doc["text"], "profiles_version": version},
-            )
-            for doc, embedding in zip(documents, embeddings)
-        ]
-        for i in range(0, len(points), 100):
-            client.upsert(collection_name=COLLECTION_NAME, points=points[i:i + 100])
-
-        return client, _collection_count(client)
+            return client, _collection_count(client) if _collection_exists(client) else 0
+        return client, index_documents(client, documents, version)
 
     except Exception:
         return None, 0

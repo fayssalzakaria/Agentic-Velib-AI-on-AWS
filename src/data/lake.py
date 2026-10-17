@@ -134,6 +134,11 @@ def station_period_profiles() -> pd.DataFrame:
     return query(f"SELECT * FROM {_gold('gold_station_period_profile')}")
 
 
+def station_embeddings() -> pd.DataFrame:
+    """Vecteurs des profils de stations, calculés par le pipeline (vide si absents)."""
+    return query(f"SELECT * FROM {_gold('station_profile_embeddings')}")
+
+
 def _since(days: int | None) -> tuple[str, list]:
     """Filtre de période sur le silver (élague les partitions date=). days=None : tout l'historique."""
     if days is None:

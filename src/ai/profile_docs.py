@@ -5,6 +5,9 @@ Un document par station résume son comportement habituel (semaine / week-end x
 matin, après-midi, soir, nuit). C'est ce qui permet de répondre à
 « Bastille est-elle souvent vide le matin ? » : une tendance, pas une ligne brute.
 """
+import json
+
+import numpy as np
 import pandas as pd
 import pytz
 
@@ -78,3 +81,30 @@ def profiles_version(profiles: pd.DataFrame) -> str:
     if profiles is None or profiles.empty:
         return ""
     return f"{pd.Timestamp(profiles['last_seen'].max()).isoformat()}|{int(profiles['n_obs'].sum())}"
+
+
+def documents_to_frame(documents: list[dict], vectors, version: str, model: str) -> pd.DataFrame:
+    """Documents + vecteurs sous forme de table (écrite dans le gold par le pipeline)."""
+    return pd.DataFrame({
+        "station_id": [d["metadata"]["station_id"] for d in documents],
+        "text": [d["text"] for d in documents],
+        "metadata_json": [json.dumps(d["metadata"], ensure_ascii=False) for d in documents],
+        "embedding": [np.asarray(v, dtype="float32").tolist() for v in vectors],
+        "embedding_model": model,
+        "profiles_version": version,
+    })
+
+
+def documents_from_frame(frame: pd.DataFrame, model: str) -> list[dict]:
+    """Relit les documents précalculés ; ignore la table si elle vient d'un autre modèle d'embeddings."""
+    if frame is None or frame.empty or (frame["embedding_model"] != model).any():
+        return []
+    return [
+        {
+            "text": row.text,
+            "metadata": json.loads(row.metadata_json),
+            "embedding": np.asarray(row.embedding, dtype="float32"),
+            "profiles_version": row.profiles_version,
+        }
+        for row in frame.itertuples(index=False)
+    ]
